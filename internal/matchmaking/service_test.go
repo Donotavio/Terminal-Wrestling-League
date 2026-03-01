@@ -242,37 +242,86 @@ func TestWaitForTurnInputTimeoutReturnsNone(t *testing.T) {
 	}
 }
 
-func TestBuildFramePayloadUsesDeltaBetweenKeyframes(t *testing.T) {
+func TestBuildCinematicSequenceAddsANSIFrames(t *testing.T) {
 	frame := animation.Frame{
-		Full:    []string{"Turn 2", "alice HP:100 ST:100 MO:0", "bob HP:100 ST:100 MO:0"},
-		Delta:   []string{"[Δ L1] Turn 2"},
-		Effects: []animation.Effect{animation.EffectShake},
+		Keyframes: [][]string{
+			{"Turn 2 | GUARD", "k1"},
+			{"Turn 2 | IMPACT", "k2"},
+		},
 	}
 
-	payload := buildFramePayload(2, frame)
-	if len(payload) != 2 {
-		t.Fatalf("payload len = %d, want 2", len(payload))
+	steps := buildCinematicSequence(frame)
+	if len(steps) != 2 {
+		t.Fatalf("sequence len = %d, want 2", len(steps))
 	}
-	if payload[0] != "[Δ L1] Turn 2" {
-		t.Fatalf("payload[0] = %q, want delta line", payload[0])
+	if len(steps[0].Lines) < 2 || steps[0].Lines[0] != ansiClearHome {
+		t.Fatalf("first step should start with ansi clear/home: %v", steps[0].Lines)
 	}
-	if payload[1] != "effects: shake" {
-		t.Fatalf("payload[1] = %q, want effects line", payload[1])
+	if steps[0].Delay != cinematicFrameDelay {
+		t.Fatalf("first delay = %s, want %s", steps[0].Delay, cinematicFrameDelay)
+	}
+	if steps[1].Delay != cinematicTurnSettleDelay {
+		t.Fatalf("last delay = %s, want %s", steps[1].Delay, cinematicTurnSettleDelay)
 	}
 }
 
-func TestBuildFramePayloadUsesFullOnKeyframes(t *testing.T) {
+func TestBuildCinematicSequenceAppliesSlowmoDelay(t *testing.T) {
 	frame := animation.Frame{
-		Full:  []string{"Turn 5", "alice HP:95 ST:90 MO:4", "bob HP:88 ST:87 MO:2"},
-		Delta: []string{"[Δ L1] Turn 5"},
+		Keyframes: [][]string{
+			{"f1"},
+			{"f2"},
+			{"f3"},
+		},
+		Effects: []animation.Effect{animation.EffectSlowmo},
 	}
 
-	payload := buildFramePayload(5, frame)
-	if len(payload) != len(frame.Full) {
-		t.Fatalf("payload len = %d, want %d", len(payload), len(frame.Full))
+	steps := buildCinematicSequence(frame)
+	if len(steps) != 3 {
+		t.Fatalf("sequence len = %d, want 3", len(steps))
 	}
-	if payload[0] != "Turn 5" {
-		t.Fatalf("payload[0] = %q, want full frame keyframe", payload[0])
+	if steps[1].Delay != cinematicSlowmoDelay {
+		t.Fatalf("slowmo delay = %s, want %s", steps[1].Delay, cinematicSlowmoDelay)
+	}
+	if steps[2].Delay != cinematicSlowmoDelay {
+		t.Fatalf("final slowmo delay = %s, want %s", steps[2].Delay, cinematicSlowmoDelay)
+	}
+}
+
+func TestEmitCinematicSequenceBroadcastsEachFrame(t *testing.T) {
+	svc := NewInMemoryService(lobby.NewInMemoryService(), nil, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  20 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+	svc.spectators.RegisterMatch("m1")
+	watcher := make(chan []string, 4)
+	if err := svc.spectators.AddWatcher("m1", "w1", watcher, 4); err != nil {
+		t.Fatalf("add watcher: %v", err)
+	}
+	defer svc.spectators.RemoveWatcher("m1", "w1")
+	defer svc.spectators.UnregisterMatch("m1")
+
+	s1 := makeSession("p1", "alice")
+	s2 := makeSession("p2", "bob")
+	frame := animation.Frame{
+		Keyframes: [][]string{
+			{"Turn 1 | GUARD", "frame a"},
+			{"Turn 1 | IMPACT", "frame b"},
+		},
+	}
+
+	if ok := svc.emitCinematicSequence(context.Background(), frame, "m1", s1, s2); !ok {
+		t.Fatalf("emitCinematicSequence returned false")
+	}
+
+	if got := drainSessionFrameCount(s1); got != 2 {
+		t.Fatalf("p1 frame count = %d, want 2", got)
+	}
+	if got := drainSessionFrameCount(s2); got != 2 {
+		t.Fatalf("p2 frame count = %d, want 2", got)
+	}
+	if got := drainWatcherFrameCount(watcher); got != 2 {
+		t.Fatalf("watcher frame count = %d, want 2", got)
 	}
 }
 
@@ -924,6 +973,30 @@ func drainSessionOutputLines(sess player.Session) []string {
 			lines = append(lines, frame.Lines...)
 		default:
 			return lines
+		}
+	}
+}
+
+func drainSessionFrameCount(sess player.Session) int {
+	count := 0
+	for {
+		select {
+		case <-sess.Output:
+			count++
+		default:
+			return count
+		}
+	}
+}
+
+func drainWatcherFrameCount(ch chan []string) int {
+	count := 0
+	for {
+		select {
+		case <-ch:
+			count++
+		default:
+			return count
 		}
 	}
 }

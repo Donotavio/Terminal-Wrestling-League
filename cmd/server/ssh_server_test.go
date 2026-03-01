@@ -513,7 +513,7 @@ func TestRunShellFirstLoginForcesTutorial(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(8 * time.Second):
 		t.Fatalf("runShell did not return")
 	}
 
@@ -552,7 +552,7 @@ func TestRunShellAcceptsCarriageReturnInput(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(8 * time.Second):
 		t.Fatalf("runShell did not return for CR-terminated input")
 	}
 
@@ -588,7 +588,7 @@ func TestRunShellTutorialAcceptsBracketedPasteWrappedInput(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(8 * time.Second):
 		t.Fatalf("runShell did not return for bracketed-paste input")
 	}
 
@@ -623,7 +623,7 @@ func TestTutorialRetryRunsTutorialAgain(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(8 * time.Second):
 		t.Fatalf("runShell did not return")
 	}
 

@@ -498,10 +498,9 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 		})
 
 		frame := renderer.Render(sess1.Handle, sess2.Handle, result)
-		payload := buildFramePayload(result.Next.Turn, frame)
-		s.sendFrame(sess1, payload...)
-		s.sendFrame(sess2, payload...)
-		s.spectators.Broadcast(matchID, payload)
+		if !s.emitCinematicSequence(ctx, frame, matchID, sess1, sess2) {
+			return
+		}
 
 		for _, e := range result.Events {
 			if e.Type == combat.EventStatusApplied && e.Detail == "stunned" {
@@ -644,8 +643,9 @@ func (s *InMemoryService) runNPCMatch(ctx context.Context, sess player.Session) 
 			return
 		}
 		frame := renderer.Render(sess.Handle, "Coach NPC", result)
-		payload := buildFramePayload(result.Next.Turn, frame)
-		s.sendFrame(sess, payload...)
+		if !s.emitCinematicSequence(ctx, frame, "", sess) {
+			return
+		}
 	}
 
 	endedAt := s.nowFn()
@@ -670,8 +670,11 @@ const (
 	npcTakeoverTimeoutStreak = 2
 	npcSeedSaltP1            = 0xA5A5A5A5A5A5A5A5
 	npcSeedSaltP2            = 0x5A5A5A5A5A5A5A5A
-	frameKeyframeInterval    = 5
 	tutorialMaxTurns         = 8
+	cinematicFrameDelay      = 140 * time.Millisecond
+	cinematicSlowmoDelay     = 260 * time.Millisecond
+	cinematicTurnSettleDelay = 220 * time.Millisecond
+	ansiClearHome            = "\x1b[2J\x1b[H"
 )
 
 type activeMatch struct {
@@ -761,34 +764,84 @@ func (s *InMemoryService) collectTurnInputs(
 	return turnInputs, true
 }
 
-func buildFramePayload(turn int, frame animation.Frame) []string {
-	useDelta := len(frame.Delta) > 0 && !isKeyframeTurn(turn)
-	base := frame.Full
-	if useDelta {
-		base = frame.Delta
-	}
-
-	// Copy payload so appended effect lines do not mutate renderer-owned slices.
-	payload := append([]string(nil), base...)
-	if len(frame.Effects) == 0 {
-		return payload
-	}
-
-	effects := make([]string, 0, len(frame.Effects))
-	for _, effect := range frame.Effects {
-		effects = append(effects, string(effect))
-	}
-	return append(payload, fmt.Sprintf("effects: %s", strings.Join(effects, ",")))
+type payloadStep struct {
+	Lines []string
+	Delay time.Duration
 }
 
-func isKeyframeTurn(turn int) bool {
-	if turn <= 1 {
+func buildCinematicSequence(frame animation.Frame) []payloadStep {
+	baseFrames := frame.Keyframes
+	if len(baseFrames) == 0 && len(frame.Full) > 0 {
+		baseFrames = [][]string{frame.Full}
+	}
+	if len(baseFrames) == 0 {
+		return nil
+	}
+
+	slowmo := containsEffect(frame.Effects, animation.EffectSlowmo)
+	steps := make([]payloadStep, 0, len(baseFrames))
+	for i, keyframe := range baseFrames {
+		lines := make([]string, 0, len(keyframe)+1)
+		lines = append(lines, ansiClearHome)
+		lines = append(lines, keyframe...)
+
+		delay := cinematicTurnSettleDelay
+		if i < len(baseFrames)-1 {
+			delay = cinematicFrameDelay
+			if slowmo && i == len(baseFrames)-2 {
+				delay = cinematicSlowmoDelay
+			}
+		} else if slowmo {
+			delay = cinematicSlowmoDelay
+		}
+		steps = append(steps, payloadStep{
+			Lines: lines,
+			Delay: delay,
+		})
+	}
+	return steps
+}
+
+func containsEffect(effects []animation.Effect, want animation.Effect) bool {
+	for _, effect := range effects {
+		if effect == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
 		return true
 	}
-	if frameKeyframeInterval <= 0 {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
 		return true
 	}
-	return turn%frameKeyframeInterval == 0
+}
+
+func (s *InMemoryService) emitCinematicSequence(ctx context.Context, frame animation.Frame, spectatorMatchID string, sessions ...player.Session) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	steps := buildCinematicSequence(frame)
+	for _, step := range steps {
+		for _, sess := range sessions {
+			s.sendFrame(sess, step.Lines...)
+		}
+		if spectatorMatchID != "" {
+			s.spectators.Broadcast(spectatorMatchID, step.Lines)
+		}
+		if !sleepWithContext(ctx, step.Delay) {
+			return false
+		}
+	}
+	return true
 }
 
 func orderTurnResultsBySlot(slot1, slot2 *matchSlot, results ...turnInputResult) ([]turnInputResult, bool) {
@@ -1394,8 +1447,9 @@ func (s *InMemoryService) RunTutorial(ctx context.Context, sess player.Session) 
 			return storage.TutorialRun{}, fmt.Errorf("run tutorial step: %w", err)
 		}
 		frame := renderer.Render(sess.Handle, "Coach NPC", result)
-		payload := buildFramePayload(result.Next.Turn, frame)
-		s.sendFrame(sess, payload...)
+		if !s.emitCinematicSequence(ctx, frame, "", sess) {
+			return storage.TutorialRun{}, ctx.Err()
+		}
 	}
 
 	finalState := sim.State()
