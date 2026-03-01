@@ -2,10 +2,12 @@ package matchmaking
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/animation"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/combat"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/lobby"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/player"
@@ -89,8 +91,8 @@ func (l *pairFailureLobby) GetSession(playerID string) (player.Session, bool) {
 func TestWaitForTurnInputTimeoutReturnsNone(t *testing.T) {
 	sess := makeSession("p1", "alice")
 	result := waitForTurnInput(context.Background(), sess, 10*time.Millisecond)
-	if !result.ok {
-		t.Fatalf("input collection should not be canceled")
+	if result.status != turnInputTimeout {
+		t.Fatalf("status = %s, want %s", result.status, turnInputTimeout)
 	}
 	input := result.input
 	if input.PlayerID != "p1" {
@@ -101,6 +103,158 @@ func TestWaitForTurnInputTimeoutReturnsNone(t *testing.T) {
 	}
 	if input.Target != combat.ZoneTorso {
 		t.Fatalf("target = %s, want Torso", input.Target)
+	}
+}
+
+func TestBuildFramePayloadUsesDeltaBetweenKeyframes(t *testing.T) {
+	frame := animation.Frame{
+		Full:    []string{"Turn 2", "alice HP:100 ST:100 MO:0", "bob HP:100 ST:100 MO:0"},
+		Delta:   []string{"[Δ L1] Turn 2"},
+		Effects: []animation.Effect{animation.EffectShake},
+	}
+
+	payload := buildFramePayload(2, frame)
+	if len(payload) != 2 {
+		t.Fatalf("payload len = %d, want 2", len(payload))
+	}
+	if payload[0] != "[Δ L1] Turn 2" {
+		t.Fatalf("payload[0] = %q, want delta line", payload[0])
+	}
+	if payload[1] != "effects: shake" {
+		t.Fatalf("payload[1] = %q, want effects line", payload[1])
+	}
+}
+
+func TestBuildFramePayloadUsesFullOnKeyframes(t *testing.T) {
+	frame := animation.Frame{
+		Full:  []string{"Turn 5", "alice HP:95 ST:90 MO:4", "bob HP:88 ST:87 MO:2"},
+		Delta: []string{"[Δ L1] Turn 5"},
+	}
+
+	payload := buildFramePayload(5, frame)
+	if len(payload) != len(frame.Full) {
+		t.Fatalf("payload len = %d, want %d", len(payload), len(frame.Full))
+	}
+	if payload[0] != "Turn 5" {
+		t.Fatalf("payload[0] = %q, want full frame keyframe", payload[0])
+	}
+}
+
+func TestOrderTurnResultsBySlotUsesStablePlayerOrder(t *testing.T) {
+	slot1 := &matchSlot{session: makeSession("p1", "alice")}
+	slot2 := &matchSlot{session: makeSession("p2", "bob")}
+
+	ordered, ok := orderTurnResultsBySlot(
+		slot1,
+		slot2,
+		turnInputResult{playerID: "p2", status: turnInputTimeout},
+		turnInputResult{playerID: "p1", status: turnInputDisconnect},
+	)
+	if !ok {
+		t.Fatalf("expected results to be ordered")
+	}
+	if ordered[0].playerID != "p1" || ordered[1].playerID != "p2" {
+		t.Fatalf("ordered players = [%s,%s], want [p1,p2]", ordered[0].playerID, ordered[1].playerID)
+	}
+}
+
+func TestRunMatchTakesOverByNPCAfterTwoTimeouts(t *testing.T) {
+	lb := lobby.NewInMemoryService()
+	s1 := makeSession("p1", "alice")
+	s2 := makeSession("p2", "bob")
+	if err := lb.Register(s1); err != nil {
+		t.Fatalf("register s1: %v", err)
+	}
+	if err := lb.Register(s2); err != nil {
+		t.Fatalf("register s2: %v", err)
+	}
+
+	now := time.Now().UTC()
+	s2.Input <- player.Command{Kind: player.CommandAction, Action: combat.ActionBlock, Target: combat.ZoneTorso, ReceivedAt: now}
+	s2.Input <- player.Command{Kind: player.CommandAction, Action: combat.ActionStrike, Target: combat.ZoneHead, ReceivedAt: now}
+
+	mf := &mockFinalizer{}
+	svc := NewInMemoryService(lb, mf, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  20 * time.Millisecond,
+		MaxTurns:     2,
+	}, nil)
+
+	svc.runMatch(context.Background(), s1, s2)
+
+	_, params := mf.snapshot()
+	if len(params) != 1 || params[0].Replay == nil {
+		t.Fatalf("expected one replay payload")
+	}
+	replay := params[0].Replay
+	if len(replay.Turns) != 2 {
+		t.Fatalf("replay turns = %d, want 2", len(replay.Turns))
+	}
+
+	t1p1, ok := replayInputForPlayer(replay, 1, "p1")
+	if !ok {
+		t.Fatalf("missing p1 input for turn 1")
+	}
+	if t1p1.Action != combat.ActionNone {
+		t.Fatalf("turn1 p1 action = %s, want None", t1p1.Action)
+	}
+
+	t2p1, ok := replayInputForPlayer(replay, 2, "p1")
+	if !ok {
+		t.Fatalf("missing p1 input for turn 2")
+	}
+	if t2p1.Action == combat.ActionNone {
+		t.Fatalf("turn2 p1 action = None, want NPC takeover action")
+	}
+
+	if !sessionOutputContains(s1, "NPC takeover enabled (timeout).") {
+		t.Fatalf("expected timeout takeover notification")
+	}
+}
+
+func TestRunMatchTakesOverByNPCOnDisconnectSameTurn(t *testing.T) {
+	lb := lobby.NewInMemoryService()
+	s1 := makeSession("p1", "alice")
+	s2 := makeSession("p2", "bob")
+	if err := lb.Register(s1); err != nil {
+		t.Fatalf("register s1: %v", err)
+	}
+	if err := lb.Register(s2); err != nil {
+		t.Fatalf("register s2: %v", err)
+	}
+
+	now := time.Now().UTC()
+	s1.Input <- player.Command{Kind: player.CommandQuit, ReceivedAt: now}
+	s2.Input <- player.Command{Kind: player.CommandAction, Action: combat.ActionBlock, Target: combat.ZoneTorso, ReceivedAt: now}
+
+	mf := &mockFinalizer{}
+	svc := NewInMemoryService(lb, mf, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  25 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	svc.runMatch(context.Background(), s1, s2)
+
+	_, params := mf.snapshot()
+	if len(params) != 1 || params[0].Replay == nil {
+		t.Fatalf("expected one replay payload")
+	}
+	replay := params[0].Replay
+	if len(replay.Turns) != 1 {
+		t.Fatalf("replay turns = %d, want 1", len(replay.Turns))
+	}
+
+	t1p1, ok := replayInputForPlayer(replay, 1, "p1")
+	if !ok {
+		t.Fatalf("missing p1 input for turn 1")
+	}
+	if t1p1.Action == combat.ActionNone {
+		t.Fatalf("turn1 p1 action = None, want immediate NPC takeover action")
+	}
+
+	if !sessionOutputContains(s1, "NPC takeover enabled (disconnect).") {
+		t.Fatalf("expected disconnect takeover notification")
 	}
 }
 
@@ -282,5 +436,34 @@ func TestStopCancelsActiveTurnCollection(t *testing.T) {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("Stop did not cancel active turn collection promptly")
+	}
+}
+
+func replayInputForPlayer(replay *storage.MatchReplayWrite, turn int, playerID string) (combat.TurnInput, bool) {
+	for _, replayTurn := range replay.Turns {
+		if replayTurn.Turn != turn {
+			continue
+		}
+		for _, input := range replayTurn.Inputs {
+			if input.PlayerID == playerID {
+				return input, true
+			}
+		}
+	}
+	return combat.TurnInput{}, false
+}
+
+func sessionOutputContains(sess player.Session, needle string) bool {
+	for {
+		select {
+		case frame := <-sess.Output:
+			for _, line := range frame.Lines {
+				if strings.Contains(line, needle) {
+					return true
+				}
+			}
+		default:
+			return false
+		}
 	}
 }
