@@ -172,9 +172,6 @@ func (s *InMemoryService) Stop() {
 func (s *InMemoryService) Enqueue(playerID string) error {
 	s.mu.Lock()
 	_, busy := s.inMatch[playerID]
-	if _, exists := s.queueJoinedAt[playerID]; !exists {
-		s.queueJoinedAt[playerID] = s.nowFn()
-	}
 	s.mu.Unlock()
 	if busy {
 		return fmt.Errorf("player %s is already in a match", playerID)
@@ -182,6 +179,11 @@ func (s *InMemoryService) Enqueue(playerID string) error {
 	if err := s.lobby.JoinQueue(playerID); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	if _, exists := s.queueJoinedAt[playerID]; !exists {
+		s.queueJoinedAt[playerID] = s.nowFn()
+	}
+	s.mu.Unlock()
 	s.persistQueueEvent(context.Background(), storage.QueueTelemetryEvent{
 		PlayerID:    playerID,
 		EventType:   "join",

@@ -526,6 +526,63 @@ func TestProcessQueueRequeuesAvailablePlayerWhenPeerMissing(t *testing.T) {
 	}
 }
 
+func TestEnqueueRejectedInMatchDoesNotTrackQueueStart(t *testing.T) {
+	lb := lobby.NewInMemoryService()
+	sess := makeSession("p1", "alice")
+	if err := lb.Register(sess); err != nil {
+		t.Fatalf("register session: %v", err)
+	}
+
+	svc := NewInMemoryService(lb, nil, MatchConfig{
+		QueueTimeout: 10 * time.Second,
+		TurnTimeout:  50 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	svc.mu.Lock()
+	svc.inMatch["p1"] = struct{}{}
+	svc.mu.Unlock()
+
+	if err := svc.Enqueue("p1"); err == nil {
+		t.Fatalf("expected enqueue to fail while in match")
+	}
+
+	svc.mu.Lock()
+	_, exists := svc.queueJoinedAt["p1"]
+	svc.mu.Unlock()
+	if exists {
+		t.Fatalf("queue start timestamp should not be recorded on rejected enqueue")
+	}
+}
+
+func TestEnqueueSuccessfulJoinTracksQueueStart(t *testing.T) {
+	lb := lobby.NewInMemoryService()
+	sess := makeSession("p1", "alice")
+	if err := lb.Register(sess); err != nil {
+		t.Fatalf("register session: %v", err)
+	}
+
+	svc := NewInMemoryService(lb, nil, MatchConfig{
+		QueueTimeout: 10 * time.Second,
+		TurnTimeout:  50 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	if err := svc.Enqueue("p1"); err != nil {
+		t.Fatalf("enqueue should succeed: %v", err)
+	}
+
+	svc.mu.Lock()
+	joinedAt, exists := svc.queueJoinedAt["p1"]
+	svc.mu.Unlock()
+	if !exists {
+		t.Fatalf("queue start timestamp should be recorded after successful enqueue")
+	}
+	if joinedAt.IsZero() {
+		t.Fatalf("queue start timestamp is zero")
+	}
+}
+
 func TestStopCancelsActiveTurnCollection(t *testing.T) {
 	lb := lobby.NewInMemoryService()
 	s1 := makeSession("p1", "alice")

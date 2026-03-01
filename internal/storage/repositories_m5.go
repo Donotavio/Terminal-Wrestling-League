@@ -156,35 +156,21 @@ func (r *SQLRepositories) GetOrCreateProfile(ctx context.Context, playerID strin
 		return PlayerProfile{}, fmt.Errorf("player id is required")
 	}
 
-	profile, err := r.getProfile(ctx, playerID)
-	if err == nil {
-		return profile, nil
-	}
-	if !errors.Is(err, ErrNotFound) {
-		return PlayerProfile{}, err
-	}
-
 	now := r.nowFn()
-	profile = PlayerProfile{
-		PlayerID:          playerID,
-		TutorialCompleted: false,
-		TutorialRuns:      0,
-		CreatedAt:         now,
-		UpdatedAt:         now,
-	}
-	_, err = r.pool.Exec(ctx,
+	_, err := r.pool.Exec(ctx,
 		`INSERT INTO player_profiles (
 		   player_id, tutorial_completed, tutorial_completed_at, tutorial_runs, created_at, updated_at
-		 ) VALUES ($1, $2, $3, $4, $5, $6)`,
-		profile.PlayerID,
-		profile.TutorialCompleted,
-		profile.TutorialCompletedAt,
-		profile.TutorialRuns,
-		profile.CreatedAt,
-		profile.UpdatedAt,
+		 ) VALUES ($1, FALSE, NULL, 0, $2, $2)
+		 ON CONFLICT (player_id) DO NOTHING`,
+		playerID,
+		now.UTC(),
 	)
 	if err != nil {
 		return PlayerProfile{}, fmt.Errorf("insert player profile: %w", err)
+	}
+	profile, err := r.getProfile(ctx, playerID)
+	if err != nil {
+		return PlayerProfile{}, err
 	}
 	return profile, nil
 }

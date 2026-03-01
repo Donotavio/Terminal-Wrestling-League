@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -59,6 +60,55 @@ func TestProfileAndTutorialRunIntegration(t *testing.T) {
 	}
 	if profile.TutorialRuns != 1 {
 		t.Fatalf("tutorial_runs = %d, want 1", profile.TutorialRuns)
+	}
+}
+
+func TestGetOrCreateProfileConcurrentCalls(t *testing.T) {
+	ctx := context.Background()
+	pool, cleanup := newIsolatedPool(t, ctx)
+	defer cleanup()
+
+	if err := ApplyMigrations(ctx, pool, migrationDir(t)); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	repos := NewSQLRepositories(pool, nil)
+	playerEntity, err := repos.Create(ctx, "m5_profile_concurrent")
+	if err != nil {
+		t.Fatalf("create player: %v", err)
+	}
+
+	const workers = 16
+	start := make(chan struct{})
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := repos.GetOrCreateProfile(ctx, playerEntity.ID)
+			errCh <- err
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("get or create profile in concurrent call: %v", err)
+		}
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM player_profiles WHERE player_id = $1`, playerEntity.ID).Scan(&count); err != nil {
+		t.Fatalf("count player_profiles: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("player_profiles count = %d, want 1", count)
 	}
 }
 

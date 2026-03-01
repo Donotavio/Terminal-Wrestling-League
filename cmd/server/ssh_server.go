@@ -326,12 +326,13 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 }
 
 func (s *sshServer) handleUserInput(ctx context.Context, sess player.Session, profile *storage.PlayerProfile, line string) bool {
-	fields := strings.Fields(strings.ToLower(line))
+	fields := strings.Fields(strings.TrimSpace(line))
 	if len(fields) == 0 {
 		return true
 	}
+	command := strings.ToLower(fields[0])
 
-	switch fields[0] {
+	switch command {
 	case "q":
 		if profile != nil && !profile.TutorialCompleted {
 			s.sendSessionFrame(sess, "tutorial required before queue: complete first-time tutorial or run `tutorial retry`")
@@ -363,7 +364,8 @@ func (s *sshServer) handleUserInput(ctx context.Context, sess player.Session, pr
 			s.sendSessionFrame(sess, "usage: watch <handle>")
 			return true
 		}
-		if err := s.matcher.WatchByHandle(ctx, sess, fields[1], s.cfg.WatchWaitTimeout, s.cfg.SpectatorMaxPerMatch); err != nil {
+		targetHandle := strings.TrimSpace(fields[1])
+		if err := s.matcher.WatchByHandle(ctx, sess, targetHandle, s.cfg.WatchWaitTimeout, s.cfg.SpectatorMaxPerMatch); err != nil {
 			s.sendSessionFrame(sess, "watch error: "+err.Error())
 		}
 		return true
@@ -384,7 +386,11 @@ func (s *sshServer) handleUserInput(ctx context.Context, sess player.Session, pr
 			s.sendSessionFrame(sess, "action rate limit reached")
 			return true
 		}
-		cmd, err := parseActionCommand(fields)
+		actionFields := make([]string, len(fields))
+		for i, field := range fields {
+			actionFields[i] = strings.ToLower(field)
+		}
+		cmd, err := parseActionCommand(actionFields)
 		if err != nil {
 			s.sendSessionFrame(sess, err.Error())
 			return true

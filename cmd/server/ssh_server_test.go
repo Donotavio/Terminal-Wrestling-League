@@ -39,6 +39,59 @@ func (f *fakeTutorialEnsurer) EnsurePlayerSession(_ context.Context, handle stri
 	}, nil
 }
 
+type caseSensitiveWatchFinalizer struct {
+	players map[string]storage.Player
+}
+
+func (f *caseSensitiveWatchFinalizer) FinalizeMatch(_ context.Context, _ storage.FinalizeMatchParams) (storage.FinalizedMatch, error) {
+	return storage.FinalizedMatch{}, nil
+}
+
+func (f *caseSensitiveWatchFinalizer) GetByHandle(_ context.Context, handle string) (storage.Player, error) {
+	playerEntity, ok := f.players[strings.TrimSpace(handle)]
+	if !ok {
+		return storage.Player{}, storage.ErrNotFound
+	}
+	return playerEntity, nil
+}
+
+func (f *caseSensitiveWatchFinalizer) LoadAntiBotConfig(_ context.Context) (storage.AntiBotConfig, error) {
+	return storage.DefaultAntiBotConfig(), nil
+}
+
+func (f *caseSensitiveWatchFinalizer) CreateAntiBotFlag(_ context.Context, flag storage.AntiBotFlag) (storage.AntiBotFlag, error) {
+	return flag, nil
+}
+
+func (f *caseSensitiveWatchFinalizer) InsertTurnTelemetryBatch(_ context.Context, _ []storage.MatchTurnTelemetry) error {
+	return nil
+}
+
+func (f *caseSensitiveWatchFinalizer) InsertMatchSummaryTelemetry(_ context.Context, summary storage.MatchSummaryTelemetry) (storage.MatchSummaryTelemetry, error) {
+	return summary, nil
+}
+
+func (f *caseSensitiveWatchFinalizer) CreateQueueTelemetryEvent(_ context.Context, event storage.QueueTelemetryEvent) (storage.QueueTelemetryEvent, error) {
+	return event, nil
+}
+
+func (f *caseSensitiveWatchFinalizer) CreateSpectatorTelemetryEvent(_ context.Context, event storage.SpectatorTelemetryEvent) (storage.SpectatorTelemetryEvent, error) {
+	return event, nil
+}
+
+func (f *caseSensitiveWatchFinalizer) CreateTutorialRun(_ context.Context, run storage.TutorialRun) (storage.TutorialRun, error) {
+	return run, nil
+}
+
+func (f *caseSensitiveWatchFinalizer) MarkTutorialCompleted(_ context.Context, playerID string, now time.Time) (storage.PlayerProfile, error) {
+	return storage.PlayerProfile{
+		PlayerID:            playerID,
+		TutorialCompleted:   true,
+		TutorialCompletedAt: &now,
+		UpdatedAt:           now,
+	}, nil
+}
+
 type fakeConnMeta struct {
 	user string
 	addr net.Addr
@@ -287,6 +340,57 @@ func TestQueueCommandRequiresTutorialCompletion(t *testing.T) {
 		}
 	default:
 		t.Fatalf("expected feedback frame for tutorial gate")
+	}
+}
+
+func TestWatchCommandPreservesTargetHandleCasing(t *testing.T) {
+	cfg := Config{
+		SSHAddr:              "127.0.0.1:0",
+		SSHUsers:             map[string]string{"alice": "secret"},
+		WatchWaitTimeout:     1 * time.Millisecond,
+		SpectatorMaxPerMatch: 20,
+	}
+	lb := lobby.NewInMemoryService()
+	finalizer := &caseSensitiveWatchFinalizer{
+		players: map[string]storage.Player{
+			"Alice": {ID: "p-target", Handle: "Alice"},
+		},
+	}
+	matchSvc := matchmaking.NewInMemoryService(lb, finalizer, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  5 * time.Second,
+		MaxTurns:     120,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	sess := player.Session{
+		PlayerID: "spectator-1",
+		Handle:   "viewer",
+		Input:    make(chan player.Command, 8),
+		Output:   make(chan player.Frame, 8),
+	}
+	profile := storage.PlayerProfile{PlayerID: sess.PlayerID, TutorialCompleted: true}
+	if ok := server.handleUserInput(context.Background(), sess, &profile, "watch Alice"); !ok {
+		t.Fatalf("watch command should not terminate session")
+	}
+
+	select {
+	case frame := <-sess.Output:
+		if len(frame.Lines) == 0 {
+			t.Fatalf("expected feedback frame")
+		}
+		msg := strings.ToLower(frame.Lines[0])
+		if !strings.Contains(msg, "no active pvp match") {
+			t.Fatalf("unexpected watch response: %q", frame.Lines[0])
+		}
+		if strings.Contains(msg, "not found") {
+			t.Fatalf("watch lookup should preserve target handle casing, got: %q", frame.Lines[0])
+		}
+	default:
+		t.Fatalf("expected watch feedback frame")
 	}
 }
 
