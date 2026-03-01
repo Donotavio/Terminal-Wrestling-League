@@ -11,6 +11,7 @@ import (
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/matchmaking"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/ranking"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/storage"
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/telemetry"
 )
 
 func main() {
@@ -35,13 +36,14 @@ func main() {
 	rankingSvc := ranking.NewGlicko2Service(ranking.DefaultConfig())
 	repos := storage.NewSQLRepositories(pool, rankingSvc)
 	lobbySvc := lobby.NewInMemoryService()
+	metrics := telemetry.NewInMemoryCollector()
 	matchSvc := matchmaking.NewInMemoryService(lobbySvc, repos, matchmaking.MatchConfig{
 		QueueTimeout: cfg.QueueTimeout,
 		TurnTimeout:  cfg.TurnTimeout,
 		MaxTurns:     cfg.MaxTurns,
-	}, nil)
+	}, metrics)
 
-	srv, err := newSSHServer(cfg, lobbySvc, matchSvc, &sqlPlayerEnsurer{repos: repos}, nil, log.Default())
+	srv, err := newSSHServer(cfg, lobbySvc, matchSvc, &sqlPlayerEnsurer{repos: repos}, metrics, log.Default())
 	if err != nil {
 		log.Fatalf("create ssh server: %v", err)
 	}
