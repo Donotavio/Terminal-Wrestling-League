@@ -11,12 +11,12 @@ type rateBucket struct {
 }
 
 type tokenBucketLimiter struct {
-	mu     sync.Mutex
-	rate   float64
-	burst  float64
-	state  map[string]rateBucket
-	nowFn  func() time.Time
-	ttl    time.Duration
+	mu    sync.Mutex
+	rate  float64
+	burst float64
+	state map[string]rateBucket
+	nowFn func() time.Time
+	ttl   time.Duration
 }
 
 func newTokenBucketLimiter(limitPerMinute int, burst int) *tokenBucketLimiter {

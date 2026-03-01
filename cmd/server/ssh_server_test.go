@@ -26,12 +26,14 @@ type fakeConnMeta struct {
 	addr net.Addr
 }
 
-func (f fakeConnMeta) User() string                { return f.user }
-func (f fakeConnMeta) SessionID() []byte           { return []byte("sid") }
-func (f fakeConnMeta) ClientVersion() []byte       { return []byte("c") }
-func (f fakeConnMeta) ServerVersion() []byte       { return []byte("s") }
-func (f fakeConnMeta) RemoteAddr() net.Addr        { return f.addr }
-func (f fakeConnMeta) LocalAddr() net.Addr         { return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222} }
+func (f fakeConnMeta) User() string          { return f.user }
+func (f fakeConnMeta) SessionID() []byte     { return []byte("sid") }
+func (f fakeConnMeta) ClientVersion() []byte { return []byte("c") }
+func (f fakeConnMeta) ServerVersion() []byte { return []byte("s") }
+func (f fakeConnMeta) RemoteAddr() net.Addr  { return f.addr }
+func (f fakeConnMeta) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222}
+}
 func (f fakeConnMeta) Permissions() *ssh.Permissions { return nil }
 
 func TestSSHAuthIntegration(t *testing.T) {

@@ -37,8 +37,8 @@ type sshServer struct {
 	telemetry metricRecorder
 	logger    *log.Logger
 
-	loginLimiter *tokenBucketLimiter
-	queueLimiter *tokenBucketLimiter
+	loginLimiter  *tokenBucketLimiter
+	queueLimiter  *tokenBucketLimiter
 	actionLimiter *tokenBucketLimiter
 
 	sshConfig *ssh.ServerConfig
@@ -69,16 +69,16 @@ func newSSHServer(
 	}
 
 	s := &sshServer{
-		cfg:          cfg,
-		lobby:        lobbySvc,
-		matcher:      matcher,
-		ensurer:      ensurer,
-		telemetry:    telemetry,
-		logger:       logger,
-		loginLimiter: newTokenBucketLimiter(5, 3),
-		queueLimiter: newTokenBucketLimiter(10, 10),
+		cfg:           cfg,
+		lobby:         lobbySvc,
+		matcher:       matcher,
+		ensurer:       ensurer,
+		telemetry:     telemetry,
+		logger:        logger,
+		loginLimiter:  newTokenBucketLimiter(5, 3),
+		queueLimiter:  newTokenBucketLimiter(10, 10),
 		actionLimiter: newTokenBucketLimiter(30, 30),
-		sessions:     map[string]player.Session{},
+		sessions:      map[string]player.Session{},
 	}
 
 	sshCfg := &ssh.ServerConfig{
