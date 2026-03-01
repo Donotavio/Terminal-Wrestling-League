@@ -1,0 +1,25 @@
+# Go build/test artifacts
+bin/
+dist/
+*.test
+*.out
+coverage.*
+*.coverprofile
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Temporary and log files
+tmp/
+*.log
+
+# Local helper artifacts
+*.tmp
