@@ -25,6 +25,12 @@ func CanonicalizeInputs(state MatchState, inputs []TurnInput) ([]TurnInput, erro
 	if ids[0] == ids[1] {
 		return nil, fmt.Errorf("match state has duplicate player id: %q", ids[0])
 	}
+	valid := map[string]struct{}{ids[0]: {}, ids[1]: {}}
+	for id := range byPlayer {
+		if _, ok := valid[id]; !ok {
+			return nil, fmt.Errorf("input contains unknown player id %q", id)
+		}
+	}
 	sort.Strings(ids)
 
 	ordered := make([]TurnInput, 0, 2)
