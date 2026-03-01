@@ -27,6 +27,7 @@ type Service interface {
 	Stop()
 	Enqueue(playerID string) error
 	Dequeue(playerID string)
+	StartNPCMatch(sess player.Session) error
 	RunTutorial(ctx context.Context, sess player.Session) (storage.TutorialRun, error)
 	WatchByHandle(ctx context.Context, spectatorSession player.Session, targetHandle string, waitTimeout time.Duration, maxSpectators int) error
 }
@@ -221,6 +222,61 @@ func (s *InMemoryService) Dequeue(playerID string) {
 	if sess, ok := s.lobby.GetSession(playerID); ok {
 		s.sendFrame(sess, "Left queue.")
 	}
+}
+
+func (s *InMemoryService) StartNPCMatch(sess player.Session) error {
+	if sess.PlayerID == "" {
+		return fmt.Errorf("player id is required")
+	}
+	if _, ok := s.lobby.GetSession(sess.PlayerID); !ok {
+		return fmt.Errorf("player %s is not registered", sess.PlayerID)
+	}
+
+	s.mu.Lock()
+	if _, busy := s.inMatch[sess.PlayerID]; busy {
+		s.mu.Unlock()
+		return fmt.Errorf("player %s is already in a match", sess.PlayerID)
+	}
+	s.inMatch[sess.PlayerID] = struct{}{}
+	joinedAt, queued := s.queueJoinedAt[sess.PlayerID]
+	if queued {
+		delete(s.queueJoinedAt, sess.PlayerID)
+	}
+	matchCtx := s.runCtx
+	s.mu.Unlock()
+
+	_ = s.lobby.LeaveQueue(sess.PlayerID)
+	if queued {
+		waitMS := s.nowFn().Sub(joinedAt).Milliseconds()
+		if waitMS < 0 {
+			waitMS = 0
+		}
+		s.persistQueueEvent(context.Background(), storage.QueueTelemetryEvent{
+			PlayerID:    sess.PlayerID,
+			EventType:   "leave",
+			QueueWaitMS: waitMS,
+		})
+	}
+
+	s.sendFrame(sess,
+		"Practice match started against Coach NPC.",
+		"Send actions with: a <action> <zone>",
+	)
+	if s.telemetry != nil {
+		s.telemetry.IncCounter("npc_matches_started")
+	}
+
+	if matchCtx == nil {
+		matchCtx = context.Background()
+	}
+	s.wg.Add(1)
+	go func(ctx context.Context) {
+		defer s.wg.Done()
+		s.runNPCMatch(ctx, sess)
+		s.releasePlayers(sess.PlayerID)
+	}(matchCtx)
+
+	return nil
 }
 
 func (s *InMemoryService) IsPlayerInMatch(playerID string) bool {
@@ -522,6 +578,92 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 		s.sendFrame(sess1, "Defeat.")
 		s.sendFrame(sess2, "Victory!")
 	}
+}
+
+func (s *InMemoryService) runNPCMatch(ctx context.Context, sess player.Session) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer drainSessionInput(sess)
+
+	startedAt := s.nowFn()
+	npcID := "npc_practice_" + sess.PlayerID
+	playerFighter, err := combat.NewFighter(sess.PlayerID, pickArchetype(sess.PlayerID, 0))
+	if err != nil {
+		s.sendFrame(sess, "Practice aborted: failed to initialize player fighter.")
+		return
+	}
+	npcFighter, err := combat.NewFighter(npcID, combat.ArchetypeTechnician)
+	if err != nil {
+		s.sendFrame(sess, "Practice aborted: failed to initialize npc fighter.")
+		return
+	}
+
+	seed := seedWithSalt(seedForPair(sess.PlayerID, npcID, startedAt), 0xBADC0DE)
+	sim := engine.NewCombatSimulator(combat.NewMatchState(playerFighter, npcFighter), s.resolver, seed)
+	renderer := s.newRenderer()
+	npcEngine := s.newNPCEngine()
+
+	playerSlot := &matchSlot{
+		session: sess,
+		npcRNG:  engine.NewDeterministicRNG(seedWithSalt(seed, npcSeedSaltP1)),
+	}
+	npcSlot := &matchSlot{
+		session: player.Session{
+			PlayerID: npcID,
+			Handle:   "coach-npc",
+		},
+		npcControlled: true,
+		npcRNG:        engine.NewDeterministicRNG(seedWithSalt(seed, npcSeedSaltP2)),
+	}
+
+	for turn := 0; turn < s.cfg.MaxTurns; turn++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		state := sim.State()
+		if state.Outcome.Finished {
+			break
+		}
+
+		turnInputs, ok := s.collectTurnInputs(ctx, state, playerSlot, npcSlot, npcEngine)
+		if !ok {
+			return
+		}
+		canonicalInputs, err := combat.CanonicalizeInputs(state, turnInputs)
+		if err != nil {
+			s.sendFrame(sess, "Practice aborted: invalid turn inputs.")
+			return
+		}
+
+		result, err := sim.Step(canonicalInputs)
+		if err != nil {
+			s.sendFrame(sess, "Practice aborted: resolution error.")
+			return
+		}
+		frame := renderer.Render(sess.Handle, "Coach NPC", result)
+		payload := buildFramePayload(result.Next.Turn, frame)
+		s.sendFrame(sess, payload...)
+	}
+
+	endedAt := s.nowFn()
+	if s.telemetry != nil {
+		s.telemetry.IncCounter("npc_matches_finished")
+		s.telemetry.ObserveDuration("npc_match_duration", endedAt.Sub(startedAt))
+	}
+
+	resultType, winnerID := mapResult(sim.State().Outcome)
+	if winnerID == nil || resultType == storage.MatchResultDraw {
+		s.sendFrame(sess, "Practice result: draw.")
+		return
+	}
+	if *winnerID == sess.PlayerID {
+		s.sendFrame(sess, "Practice result: victory.")
+		return
+	}
+	s.sendFrame(sess, "Practice result: defeat.")
 }
 
 const (

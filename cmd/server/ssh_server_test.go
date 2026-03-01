@@ -343,6 +343,100 @@ func TestQueueCommandRequiresTutorialCompletion(t *testing.T) {
 	}
 }
 
+func TestNPCCommandRequiresTutorialCompletion(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  5 * time.Second,
+		MaxTurns:     120,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	sess := player.Session{
+		PlayerID: "p1",
+		Handle:   "alice",
+		Input:    make(chan player.Command, 8),
+		Output:   make(chan player.Frame, 8),
+	}
+	profile := storage.PlayerProfile{PlayerID: "p1", TutorialCompleted: false}
+	if ok := server.handleUserInput(context.Background(), sess, &profile, "npc"); !ok {
+		t.Fatalf("npc command should not terminate session")
+	}
+
+	select {
+	case frame := <-sess.Output:
+		if len(frame.Lines) == 0 || !strings.Contains(strings.ToLower(frame.Lines[0]), "tutorial required") {
+			t.Fatalf("unexpected feedback frame: %+v", frame.Lines)
+		}
+	default:
+		t.Fatalf("expected feedback frame for tutorial gate")
+	}
+}
+
+func TestNPCCommandStartsPracticeMatch(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  10 * time.Millisecond,
+		MaxTurns:     2,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	sess := player.Session{
+		PlayerID: "p1",
+		Handle:   "alice",
+		Input:    make(chan player.Command, 8),
+		Output:   make(chan player.Frame, 32),
+	}
+	if err := lb.Register(sess); err != nil {
+		t.Fatalf("register session: %v", err)
+	}
+
+	profile := storage.PlayerProfile{PlayerID: "p1", TutorialCompleted: true}
+	if ok := server.handleUserInput(context.Background(), sess, &profile, "npc"); !ok {
+		t.Fatalf("npc command should not terminate session")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	startSeen := false
+	for time.Now().Before(deadline) {
+		select {
+		case frame := <-sess.Output:
+			for _, line := range frame.Lines {
+				if strings.Contains(strings.ToLower(line), "practice match started") {
+					startSeen = true
+				}
+			}
+		default:
+		}
+		if startSeen && !matchSvc.IsPlayerInMatch(sess.PlayerID) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !startSeen {
+		t.Fatalf("expected npc practice start message")
+	}
+	if matchSvc.IsPlayerInMatch(sess.PlayerID) {
+		t.Fatalf("player should be released after npc practice match")
+	}
+}
+
 func TestWatchCommandPreservesTargetHandleCasing(t *testing.T) {
 	cfg := Config{
 		SSHAddr:              "127.0.0.1:0",

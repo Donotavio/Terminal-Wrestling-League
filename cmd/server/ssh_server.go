@@ -284,7 +284,7 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 
 	s.sendSessionFrame(sess,
 		"Welcome to Terminal Wrestling League!",
-		"Commands: q=join queue, l=leave queue, s=lobby snapshot, a <action> <zone>, watch <handle>, tutorial retry, quit",
+		"Commands: q=join queue, l=leave queue, s=lobby snapshot, npc=practice vs bot, a <action> <zone>, watch <handle>, tutorial retry, quit",
 	)
 
 	scanner := bufio.NewScanner(rw)
@@ -361,7 +361,16 @@ func (s *sshServer) handleUserInput(ctx context.Context, sess player.Session, pr
 		)
 		return true
 	case "help":
-		s.sendSessionFrame(sess, "Commands: q, l, s, a <action> <zone>, watch <handle>, tutorial retry, quit")
+		s.sendSessionFrame(sess, "Commands: q, l, s, npc, a <action> <zone>, watch <handle>, tutorial retry, quit")
+		return true
+	case "npc":
+		if profile != nil && !profile.TutorialCompleted {
+			s.sendSessionFrame(sess, "tutorial required before npc practice: complete first-time tutorial or run `tutorial retry`")
+			return true
+		}
+		if err := s.matcher.StartNPCMatch(sess); err != nil {
+			s.sendSessionFrame(sess, "npc error: "+err.Error())
+		}
 		return true
 	case "watch":
 		if len(fields) < 2 {

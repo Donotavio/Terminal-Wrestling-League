@@ -80,6 +80,19 @@ func TestASCIIRendererInfersEffectsDeterministically(t *testing.T) {
 	}
 }
 
+func TestASCIIRendererIncludesStickFigurePanel(t *testing.T) {
+	r := NewASCIIRenderer()
+	frame := r.Render("alice", "bob", buildTurnResult(1, 100, 100, nil, ""))
+
+	joined := strings.Join(frame.Full, "\n")
+	if !strings.Contains(joined, "alice [IDLE]") || !strings.Contains(joined, "bob [IDLE]") {
+		t.Fatalf("expected stance labels in frame, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "/|\\") {
+		t.Fatalf("expected stick figure torso in frame, got:\n%s", joined)
+	}
+}
+
 func buildTurnResult(turn int, p1HP int, p2HP int, events []combat.Event, outcome string) combat.TurnResult {
 	state := combat.MatchState{
 		Turn: turn,

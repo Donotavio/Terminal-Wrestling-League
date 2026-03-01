@@ -34,6 +34,7 @@ After login, users can run:
 - `q`: join matchmaking queue
 - `l`: leave queue
 - `s`: show lobby snapshot
+- `npc`: start an immediate practice match versus Coach NPC
 - `a <action> <zone>`: send combat action
   - actions: `strike`, `grapple`, `block`, `dodge`, `counter`, `feint`, `break`
   - zones: `head`, `torso`, `legs`

@@ -583,6 +583,65 @@ func TestEnqueueSuccessfulJoinTracksQueueStart(t *testing.T) {
 	}
 }
 
+func TestStartNPCMatchRunsAndReleasesPlayer(t *testing.T) {
+	lb := lobby.NewInMemoryService()
+	sess := makeSession("p1", "alice")
+	if err := lb.Register(sess); err != nil {
+		t.Fatalf("register session: %v", err)
+	}
+
+	svc := NewInMemoryService(lb, nil, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  10 * time.Millisecond,
+		MaxTurns:     2,
+	}, nil)
+
+	if err := svc.StartNPCMatch(sess); err != nil {
+		t.Fatalf("StartNPCMatch returned error: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && svc.IsPlayerInMatch(sess.PlayerID) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if svc.IsPlayerInMatch(sess.PlayerID) {
+		t.Fatalf("player should be released after npc match")
+	}
+
+	lines := drainSessionOutputLines(sess)
+	if !containsLine(lines, "Practice match started against Coach NPC.") {
+		t.Fatalf("missing npc match start message; lines=%v", lines)
+	}
+	if !containsAnyLine(lines, "Practice result: victory.", "Practice result: defeat.", "Practice result: draw.") {
+		t.Fatalf("missing npc match result message; lines=%v", lines)
+	}
+}
+
+func TestStartNPCMatchRejectsBusyPlayer(t *testing.T) {
+	lb := lobby.NewInMemoryService()
+	sess := makeSession("p1", "alice")
+	if err := lb.Register(sess); err != nil {
+		t.Fatalf("register session: %v", err)
+	}
+
+	svc := NewInMemoryService(lb, nil, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  10 * time.Millisecond,
+		MaxTurns:     2,
+	}, nil)
+	svc.mu.Lock()
+	svc.inMatch[sess.PlayerID] = struct{}{}
+	svc.mu.Unlock()
+
+	err := svc.StartNPCMatch(sess)
+	if err == nil {
+		t.Fatalf("expected busy player error")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "already in a match") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestStopCancelsActiveTurnCollection(t *testing.T) {
 	lb := lobby.NewInMemoryService()
 	s1 := makeSession("p1", "alice")
@@ -855,4 +914,34 @@ func sessionOutputContains(sess player.Session, needle string) bool {
 			return false
 		}
 	}
+}
+
+func drainSessionOutputLines(sess player.Session) []string {
+	lines := make([]string, 0, 8)
+	for {
+		select {
+		case frame := <-sess.Output:
+			lines = append(lines, frame.Lines...)
+		default:
+			return lines
+		}
+	}
+}
+
+func containsLine(lines []string, needle string) bool {
+	for _, line := range lines {
+		if strings.Contains(line, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAnyLine(lines []string, needles ...string) bool {
+	for _, needle := range needles {
+		if containsLine(lines, needle) {
+			return true
+		}
+	}
+	return false
 }

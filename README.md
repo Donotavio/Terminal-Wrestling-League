@@ -44,6 +44,8 @@ The project enforces deterministic combat behavior:
 
 - Authoritative queue and matchmaking over SSH
 - PvP combat with server-side turn collection and resolution
+- ASCII stick-figure panel in combat frames (with deterministic deltas)
+- Practice match mode against NPC (`npc`)
 - Deterministic NPC takeover after timeout streak or disconnect
 - Replay persistence (`match_replays`, `match_replay_turns`)
 - Persistent telemetry (session, queue, turn, match summary, spectator)
@@ -106,6 +108,7 @@ ssh alice@127.0.0.1 -p 2222
 - `q`: join queue
 - `l`: leave queue
 - `s`: lobby snapshot
+- `npc`: start a practice match against Coach NPC
 - `a <action> <zone>`: send turn action
 - `watch <handle>`: attach as spectator to target active PvP match
 - `tutorial retry`: rerun tutorial flow
