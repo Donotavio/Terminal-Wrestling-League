@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/combat"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -73,8 +75,8 @@ func TestApplyMigrationsIdempotentIntegration(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if count != 1 {
-		t.Fatalf("schema_migrations count = %d, want 1", count)
+	if count != 2 {
+		t.Fatalf("schema_migrations count = %d, want 2", count)
 	}
 }
 
@@ -209,6 +211,179 @@ func TestFinalizeMatchDrawIntegration(t *testing.T) {
 	}
 	if found != 2 {
 		t.Fatalf("draw score rows = %d, want 2", found)
+	}
+}
+
+func TestFinalizeMatchWithReplayRoundtripIntegration(t *testing.T) {
+	ctx := context.Background()
+	pool, cleanup := newIsolatedPool(t, ctx)
+	defer cleanup()
+
+	if err := ApplyMigrations(ctx, pool, migrationDir(t)); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	repos := NewSQLRepositories(pool, nil)
+	p1, err := repos.Create(ctx, "eve")
+	if err != nil {
+		t.Fatalf("create player1: %v", err)
+	}
+	p2, err := repos.Create(ctx, "frank")
+	if err != nil {
+		t.Fatalf("create player2: %v", err)
+	}
+
+	start := time.Date(2026, 3, 2, 10, 0, 0, 0, time.UTC)
+	end := start.Add(90 * time.Second)
+	winner := p1.ID
+	replayWrite := buildReplayWrite(p1.ID, p2.ID)
+
+	result, err := repos.FinalizeMatch(ctx, FinalizeMatchParams{
+		Player1ID:  p1.ID,
+		Player2ID:  p2.ID,
+		WinnerID:   &winner,
+		ResultType: MatchResultKO,
+		StartedAt:  start,
+		EndedAt:    end,
+		Replay:     &replayWrite,
+	})
+	if err != nil {
+		t.Fatalf("finalize match with replay: %v", err)
+	}
+
+	var replayCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM match_replays`).Scan(&replayCount); err != nil {
+		t.Fatalf("count match_replays: %v", err)
+	}
+	if replayCount != 1 {
+		t.Fatalf("match_replays count = %d, want 1", replayCount)
+	}
+
+	var turnCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM match_replay_turns`).Scan(&turnCount); err != nil {
+		t.Fatalf("count match_replay_turns: %v", err)
+	}
+	if turnCount != len(replayWrite.Turns) {
+		t.Fatalf("match_replay_turns count = %d, want %d", turnCount, len(replayWrite.Turns))
+	}
+
+	got, err := repos.GetMatchReplay(ctx, result.Match.ID)
+	if err != nil {
+		t.Fatalf("get match replay: %v", err)
+	}
+	if got.MatchID != result.Match.ID {
+		t.Fatalf("match id = %s, want %s", got.MatchID, result.Match.ID)
+	}
+	if got.Seed != replayWrite.Seed {
+		t.Fatalf("seed = %d, want %d", got.Seed, replayWrite.Seed)
+	}
+	if !reflect.DeepEqual(got.InitialState, replayWrite.InitialState) {
+		t.Fatalf("initial state mismatch")
+	}
+	if len(got.Turns) != len(replayWrite.Turns) {
+		t.Fatalf("replay turns len = %d, want %d", len(got.Turns), len(replayWrite.Turns))
+	}
+	for i := range got.Turns {
+		if got.Turns[i].Turn != replayWrite.Turns[i].Turn {
+			t.Fatalf("turn[%d].turn = %d, want %d", i, got.Turns[i].Turn, replayWrite.Turns[i].Turn)
+		}
+		if got.Turns[i].RelativeMS != replayWrite.Turns[i].RelativeMS {
+			t.Fatalf("turn[%d].relative_ms = %d, want %d", i, got.Turns[i].RelativeMS, replayWrite.Turns[i].RelativeMS)
+		}
+		if got.Turns[i].Checksums != replayWrite.Turns[i].Checksums {
+			t.Fatalf("turn[%d].checksums mismatch", i)
+		}
+		if !reflect.DeepEqual(got.Turns[i].Inputs, replayWrite.Turns[i].Inputs) {
+			t.Fatalf("turn[%d].inputs mismatch", i)
+		}
+	}
+}
+
+func TestFinalizeMatchReplayFailureRollsBackTransactionIntegration(t *testing.T) {
+	ctx := context.Background()
+	pool, cleanup := newIsolatedPool(t, ctx)
+	defer cleanup()
+
+	if err := ApplyMigrations(ctx, pool, migrationDir(t)); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	repos := NewSQLRepositories(pool, nil)
+	p1, err := repos.Create(ctx, "gina")
+	if err != nil {
+		t.Fatalf("create player1: %v", err)
+	}
+	p2, err := repos.Create(ctx, "henry")
+	if err != nil {
+		t.Fatalf("create player2: %v", err)
+	}
+
+	start := time.Date(2026, 3, 2, 10, 20, 0, 0, time.UTC)
+	end := start.Add(45 * time.Second)
+	winner := p1.ID
+	replayWrite := buildReplayWrite(p1.ID, p2.ID)
+	// Duplicate turn id causes PK violation in match_replay_turns.
+	replayWrite.Turns = append(replayWrite.Turns, replayWrite.Turns[0])
+
+	_, err = repos.FinalizeMatch(ctx, FinalizeMatchParams{
+		Player1ID:  p1.ID,
+		Player2ID:  p2.ID,
+		WinnerID:   &winner,
+		ResultType: MatchResultKO,
+		StartedAt:  start,
+		EndedAt:    end,
+		Replay:     &replayWrite,
+	})
+	if err == nil {
+		t.Fatalf("expected finalize match to fail with invalid replay")
+	}
+
+	assertTableCount(t, pool, "matches", 0)
+	assertTableCount(t, pool, "match_results", 0)
+	assertTableCount(t, pool, "player_ratings", 0)
+	assertTableCount(t, pool, "match_replays", 0)
+	assertTableCount(t, pool, "match_replay_turns", 0)
+}
+
+func buildReplayWrite(p1ID, p2ID string) MatchReplayWrite {
+	p1, _ := combat.NewFighter(p1ID, combat.ArchetypeBalanced)
+	p2, _ := combat.NewFighter(p2ID, combat.ArchetypeTechnician)
+	initial := combat.NewMatchState(p1, p2)
+	return MatchReplayWrite{
+		Seed:         424242,
+		InitialState: initial,
+		Turns: []MatchReplayTurnWrite{
+			{
+				Turn:       1,
+				RelativeMS: 25,
+				Inputs: []combat.TurnInput{
+					{PlayerID: p1ID, Action: combat.ActionStrike, Target: combat.ZoneHead, DecisionMS: 100},
+					{PlayerID: p2ID, Action: combat.ActionBlock, Target: combat.ZoneTorso, DecisionMS: 115},
+				},
+				Checksums: combat.TurnChecksum{StateHash: 11, RollHash: 12},
+			},
+			{
+				Turn:       2,
+				RelativeMS: 50,
+				Inputs: []combat.TurnInput{
+					{PlayerID: p1ID, Action: combat.ActionGrapple, Target: combat.ZoneTorso, DecisionMS: 135},
+					{PlayerID: p2ID, Action: combat.ActionDodge, Target: combat.ZoneLegs, DecisionMS: 140},
+				},
+				Checksums: combat.TurnChecksum{StateHash: 21, RollHash: 22},
+			},
+		},
+	}
+}
+
+func assertTableCount(t *testing.T, pool *pgxpool.Pool, table string, want int) {
+	t.Helper()
+	var got int
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, pgx.Identifier{table}.Sanitize())
+	if err := pool.QueryRow(context.Background(), query).Scan(&got); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	if got != want {
+		t.Fatalf("%s count = %d, want %d", table, got, want)
 	}
 }
 
