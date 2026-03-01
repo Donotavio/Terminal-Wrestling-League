@@ -75,8 +75,14 @@ func TestApplyMigrationsIdempotentIntegration(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if count != 2 {
-		t.Fatalf("schema_migrations count = %d, want 2", count)
+
+	migrations, err := loadMigrations(migrationDir(t))
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	expected := len(migrations)
+	if count != expected {
+		t.Fatalf("schema_migrations count = %d, want %d", count, expected)
 	}
 }
 
