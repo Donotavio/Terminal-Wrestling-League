@@ -43,9 +43,56 @@ func makeSession(id, handle string) player.Session {
 	}
 }
 
+type pairFailureLobby struct {
+	sessionByID map[string]player.Session
+	missingID   string
+	joinCalls   []string
+}
+
+func (l *pairFailureLobby) Register(session player.Session) error {
+	if l.sessionByID == nil {
+		l.sessionByID = make(map[string]player.Session)
+	}
+	l.sessionByID[session.PlayerID] = session
+	return nil
+}
+
+func (l *pairFailureLobby) Unregister(playerID string) {
+	delete(l.sessionByID, playerID)
+}
+
+func (l *pairFailureLobby) JoinQueue(playerID string) error {
+	l.joinCalls = append(l.joinCalls, playerID)
+	return nil
+}
+
+func (l *pairFailureLobby) LeaveQueue(_ string) error {
+	return nil
+}
+
+func (l *pairFailureLobby) Snapshot() lobby.LobbySnapshot {
+	return lobby.LobbySnapshot{Online: len(l.sessionByID)}
+}
+
+func (l *pairFailureLobby) PopNextPair(_ time.Time, _ time.Duration) (pair [2]string, ok bool, timedOut []string) {
+	return [2]string{"p1", "p2"}, true, nil
+}
+
+func (l *pairFailureLobby) GetSession(playerID string) (player.Session, bool) {
+	if playerID == l.missingID {
+		return player.Session{}, false
+	}
+	sess, ok := l.sessionByID[playerID]
+	return sess, ok
+}
+
 func TestWaitForTurnInputTimeoutReturnsNone(t *testing.T) {
 	sess := makeSession("p1", "alice")
-	input := waitForTurnInput(sess, 10*time.Millisecond)
+	result := waitForTurnInput(context.Background(), sess, 10*time.Millisecond)
+	if !result.ok {
+		t.Fatalf("input collection should not be canceled")
+	}
+	input := result.input
 	if input.PlayerID != "p1" {
 		t.Fatalf("player id = %s, want p1", input.PlayerID)
 	}
@@ -75,7 +122,7 @@ func TestRunMatchDrawByMaxTurnsPersistsOnce(t *testing.T) {
 		MaxTurns:     1,
 	}, nil)
 
-	svc.runMatch(s1, s2)
+	svc.runMatch(context.Background(), s1, s2)
 
 	calls, params := mf.snapshot()
 	if calls != 1 {
@@ -86,6 +133,32 @@ func TestRunMatchDrawByMaxTurnsPersistsOnce(t *testing.T) {
 	}
 	if params[0].WinnerID != nil {
 		t.Fatalf("winner id = %v, want nil", *params[0].WinnerID)
+	}
+	if params[0].Replay == nil {
+		t.Fatalf("expected replay payload")
+	}
+	replay := params[0].Replay
+	if replay.Seed == 0 {
+		t.Fatalf("replay seed = 0, want non-zero")
+	}
+	if replay.InitialState.P1.PlayerID != "p1" || replay.InitialState.P2.PlayerID != "p2" {
+		t.Fatalf("initial state players = (%s,%s), want (p1,p2)", replay.InitialState.P1.PlayerID, replay.InitialState.P2.PlayerID)
+	}
+	if len(replay.Turns) != 1 {
+		t.Fatalf("replay turns = %d, want 1", len(replay.Turns))
+	}
+	if replay.Turns[0].Turn != 1 {
+		t.Fatalf("replay turn number = %d, want 1", replay.Turns[0].Turn)
+	}
+	if replay.Turns[0].RelativeMS < 0 {
+		t.Fatalf("replay relative_ms = %d, want >= 0", replay.Turns[0].RelativeMS)
+	}
+	if len(replay.Turns[0].Inputs) != 2 {
+		t.Fatalf("replay inputs len = %d, want 2", len(replay.Turns[0].Inputs))
+	}
+	if replay.Turns[0].Inputs[0].PlayerID != "p1" || replay.Turns[0].Inputs[1].PlayerID != "p2" {
+		t.Fatalf("replay input order = [%s, %s], want [p1, p2]",
+			replay.Turns[0].Inputs[0].PlayerID, replay.Turns[0].Inputs[1].PlayerID)
 	}
 }
 
@@ -136,5 +209,78 @@ func TestProcessQueuePairsPlayersAndPersists(t *testing.T) {
 	svc.mu.Unlock()
 	if busy1 || busy2 {
 		t.Fatalf("players should be released from inMatch after match completion")
+	}
+}
+
+func TestProcessQueueRequeuesAvailablePlayerWhenPeerMissing(t *testing.T) {
+	s1 := makeSession("p1", "alice")
+	lb := &pairFailureLobby{
+		sessionByID: map[string]player.Session{
+			"p1": s1,
+		},
+		missingID: "p2",
+	}
+	svc := NewInMemoryService(lb, nil, MatchConfig{
+		QueueTimeout: 10 * time.Second,
+		TurnTimeout:  50 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	svc.processQueue(time.Now().UTC())
+
+	if len(lb.joinCalls) != 1 || lb.joinCalls[0] != "p1" {
+		t.Fatalf("join calls = %v, want [p1]", lb.joinCalls)
+	}
+	if svc.IsPlayerInMatch("p1") || svc.IsPlayerInMatch("p2") {
+		t.Fatalf("players should not stay marked in match after pair failure")
+	}
+}
+
+func TestStopCancelsActiveTurnCollection(t *testing.T) {
+	lb := lobby.NewInMemoryService()
+	s1 := makeSession("p1", "alice")
+	s2 := makeSession("p2", "bob")
+	if err := lb.Register(s1); err != nil {
+		t.Fatalf("register s1: %v", err)
+	}
+	if err := lb.Register(s2); err != nil {
+		t.Fatalf("register s2: %v", err)
+	}
+	if err := lb.JoinQueue("p1"); err != nil {
+		t.Fatalf("join queue p1: %v", err)
+	}
+	if err := lb.JoinQueue("p2"); err != nil {
+		t.Fatalf("join queue p2: %v", err)
+	}
+
+	svc := NewInMemoryService(lb, nil, MatchConfig{
+		QueueTimeout: 10 * time.Second,
+		TurnTimeout:  5 * time.Second,
+		MaxTurns:     120,
+	}, nil)
+	svc.Start(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if svc.IsPlayerInMatch("p1") && svc.IsPlayerInMatch("p2") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !svc.IsPlayerInMatch("p1") || !svc.IsPlayerInMatch("p2") {
+		svc.Stop()
+		t.Fatalf("players did not enter match")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		svc.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("Stop did not cancel active turn collection promptly")
 	}
 }
