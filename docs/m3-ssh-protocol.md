@@ -13,6 +13,8 @@ Optional:
 - `TWL_QUEUE_TIMEOUT_SEC` (default `45`)
 - `TWL_TURN_TIMEOUT_SEC` (default `5`)
 - `TWL_MAX_TURNS` (default `120`)
+- `TWL_WATCH_WAIT_TIMEOUT_SEC` (default `120`)
+- `TWL_SPECTATOR_MAX_PER_MATCH` (default `20`)
 
 ## Startup flow
 
@@ -35,8 +37,16 @@ After login, users can run:
 - `a <action> <zone>`: send combat action
   - actions: `strike`, `grapple`, `block`, `dodge`, `counter`, `feint`, `break`
   - zones: `head`, `torso`, `legs`
+- `watch <handle>`: wait and attach as spectator to target active PvP match (read-only)
+- `tutorial retry`: rerun tutorial flow (optional after first completion)
 - `help`: show command help
 - `quit` / `exit`: close session
+
+First-session gate:
+
+- On first login (`tutorial_completed=false`), tutorial is started automatically before normal shell.
+- Queue command `q` is blocked until tutorial completion.
+- Tutorial completion is marked after first tutorial fight, regardless of match result.
 
 ## Match lifecycle
 
@@ -80,3 +90,10 @@ Counters:
 Durations:
 
 - `match_duration`
+
+## Spectator runtime
+
+- Spectator stream is read-only and mirrors authoritative match frame payloads.
+- Only active PvP matches are exposed (tutorial matches are excluded).
+- `watch <handle>` waits up to `TWL_WATCH_WAIT_TIMEOUT_SEC`.
+- Per-match spectator cap is `TWL_SPECTATOR_MAX_PER_MATCH`.
