@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/animation"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/combat"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/engine"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/lobby"
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/npc"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/player"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/storage"
 	"github.com/google/uuid"
@@ -58,11 +61,13 @@ type queueLobby interface {
 
 // InMemoryService is a concrete queue/match coordinator.
 type InMemoryService struct {
-	lobby     queueLobby
-	finalizer MatchFinalizer
-	resolver  combat.Resolver
-	cfg       MatchConfig
-	telemetry Telemetry
+	lobby        queueLobby
+	finalizer    MatchFinalizer
+	resolver     combat.Resolver
+	cfg          MatchConfig
+	telemetry    Telemetry
+	newRenderer  func() animation.Renderer
+	newNPCEngine func() npc.Engine
 
 	nowFn  func() time.Time
 	stopCh chan struct{}
@@ -86,15 +91,17 @@ func NewInMemoryService(lobbySvc queueLobby, finalizer MatchFinalizer, cfg Match
 		cfg.MaxTurns = 120
 	}
 	return &InMemoryService{
-		lobby:     lobbySvc,
-		finalizer: finalizer,
-		resolver:  combat.NewStandardResolver(),
-		cfg:       cfg,
-		telemetry: telemetry,
-		nowFn:     func() time.Time { return time.Now().UTC() },
-		stopCh:    make(chan struct{}),
-		runCtx:    context.Background(),
-		inMatch:   make(map[string]struct{}),
+		lobby:        lobbySvc,
+		finalizer:    finalizer,
+		resolver:     combat.NewStandardResolver(),
+		cfg:          cfg,
+		telemetry:    telemetry,
+		newRenderer:  func() animation.Renderer { return animation.NewASCIIRenderer() },
+		newNPCEngine: func() npc.Engine { return npc.NewProbabilisticEngine() },
+		nowFn:        func() time.Time { return time.Now().UTC() },
+		stopCh:       make(chan struct{}),
+		runCtx:       context.Background(),
+		inMatch:      make(map[string]struct{}),
 	}
 }
 
@@ -268,6 +275,16 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 	initialState := combat.NewMatchState(fighter1, fighter2)
 	replayTurns := make([]storage.MatchReplayTurnWrite, 0, s.cfg.MaxTurns)
 	sim := engine.NewCombatSimulator(initialState, s.resolver, seed)
+	renderer := s.newRenderer()
+	npcEngine := s.newNPCEngine()
+	slot1 := &matchSlot{
+		session: sess1,
+		npcRNG:  engine.NewDeterministicRNG(seedWithSalt(seed, npcSeedSaltP1)),
+	}
+	slot2 := &matchSlot{
+		session: sess2,
+		npcRNG:  engine.NewDeterministicRNG(seedWithSalt(seed, npcSeedSaltP2)),
+	}
 
 	for turn := 0; turn < s.cfg.MaxTurns; turn++ {
 		select {
@@ -281,11 +298,11 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 			break
 		}
 
-		inputs, ok := s.collectTurnInputs(ctx, sess1, sess2)
+		turnInputs, ok := s.collectTurnInputs(ctx, state, slot1, slot2, npcEngine)
 		if !ok {
 			return
 		}
-		canonicalInputs, err := combat.CanonicalizeInputs(state, inputs)
+		canonicalInputs, err := combat.CanonicalizeInputs(state, turnInputs)
 		if err != nil {
 			s.sendFrame(sess1, "Match aborted: invalid turn inputs.")
 			s.sendFrame(sess2, "Match aborted: invalid turn inputs.")
@@ -309,9 +326,20 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 			Checksums:  result.Checksums,
 		})
 
-		frame := renderFrame(sess1.Handle, sess2.Handle, result)
-		s.sendFrame(sess1, frame...)
-		s.sendFrame(sess2, frame...)
+		frame := renderer.Render(sess1.Handle, sess2.Handle, result)
+		payload := frame.Full
+		if len(frame.Delta) > 0 {
+			payload = frame.Delta
+		}
+		if len(frame.Effects) > 0 {
+			effects := make([]string, 0, len(frame.Effects))
+			for _, effect := range frame.Effects {
+				effects = append(effects, string(effect))
+			}
+			payload = append(payload, fmt.Sprintf("effects: %s", strings.Join(effects, ",")))
+		}
+		s.sendFrame(sess1, payload...)
+		s.sendFrame(sess2, payload...)
 	}
 
 	finalState := sim.State()
@@ -365,22 +393,85 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 	}
 }
 
-func (s *InMemoryService) collectTurnInputs(ctx context.Context, sess1, sess2 player.Session) ([]combat.TurnInput, bool) {
-	results := make(chan turnInputResult, 2)
-	go func() { results <- waitForTurnInput(ctx, sess1, s.cfg.TurnTimeout) }()
-	go func() { results <- waitForTurnInput(ctx, sess2, s.cfg.TurnTimeout) }()
+const (
+	npcTakeoverTimeoutStreak = 2
+	npcSeedSaltP1            = 0xA5A5A5A5A5A5A5A5
+	npcSeedSaltP2            = 0x5A5A5A5A5A5A5A5A
+)
 
-	in1 := <-results
-	in2 := <-results
-	if !in1.ok || !in2.ok {
-		return nil, false
-	}
-	return []combat.TurnInput{in1.input, in2.input}, true
+type matchSlot struct {
+	session       player.Session
+	npcControlled bool
+	timeoutStreak int
+	npcRNG        npc.RandomSource
 }
 
+type turnInputStatus string
+
+const (
+	turnInputAction     turnInputStatus = "action"
+	turnInputTimeout    turnInputStatus = "timeout"
+	turnInputDisconnect turnInputStatus = "disconnect"
+	turnInputCanceled   turnInputStatus = "canceled"
+	turnInputNPC        turnInputStatus = "npc"
+)
+
 type turnInputResult struct {
-	input combat.TurnInput
-	ok    bool
+	playerID string
+	input    combat.TurnInput
+	status   turnInputStatus
+}
+
+func (s *InMemoryService) collectTurnInputs(
+	ctx context.Context,
+	state combat.MatchState,
+	slot1 *matchSlot,
+	slot2 *matchSlot,
+	npcEngine npc.Engine,
+) ([]combat.TurnInput, bool) {
+	results := make(chan turnInputResult, 2)
+
+	collect := func(slot *matchSlot) {
+		if slot.npcControlled {
+			results <- turnInputResult{
+				playerID: slot.session.PlayerID,
+				input:    decideNPCInput(state, slot.session.PlayerID, npcEngine, slot.npcRNG),
+				status:   turnInputNPC,
+			}
+			return
+		}
+		go func(sess player.Session) {
+			results <- waitForTurnInput(ctx, sess, s.cfg.TurnTimeout)
+		}(slot.session)
+	}
+	collect(slot1)
+	collect(slot2)
+
+	res1 := <-results
+	res2 := <-results
+	if res1.status == turnInputCanceled || res2.status == turnInputCanceled {
+		return nil, false
+	}
+
+	orderedResults := []turnInputResult{res1, res2}
+	turnInputs := make([]combat.TurnInput, 0, 2)
+	for _, res := range orderedResults {
+		slot := findSlotByPlayerID(res.playerID, slot1, slot2)
+		if slot == nil {
+			return nil, false
+		}
+		input, takeoverReason := resolveTurnInput(state, slot, res, npcEngine)
+		if takeoverReason != "" {
+			other := slot1
+			if slot == slot1 {
+				other = slot2
+			}
+			s.sendFrame(slot.session, fmt.Sprintf("NPC takeover enabled (%s).", takeoverReason))
+			s.sendFrame(other.session, fmt.Sprintf("Opponent %s is now controlled by NPC (%s).", slot.session.Handle, takeoverReason))
+		}
+		turnInputs = append(turnInputs, input)
+	}
+	return turnInputs, true
 }
 
 func waitForTurnInput(ctx context.Context, sess player.Session, timeout time.Duration) turnInputResult {
@@ -393,12 +484,13 @@ func waitForTurnInput(ctx context.Context, sess player.Session, timeout time.Dur
 	for {
 		select {
 		case <-ctx.Done():
-			return turnInputResult{ok: false}
+			return turnInputResult{playerID: sess.PlayerID, status: turnInputCanceled}
 		case cmd, ok := <-sess.Input:
 			if !ok {
 				return turnInputResult{
-					input: combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso},
-					ok:    true,
+					playerID: sess.PlayerID,
+					input:    combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso},
+					status:   turnInputDisconnect,
 				}
 			}
 			switch cmd.Kind {
@@ -408,24 +500,107 @@ func waitForTurnInput(ctx context.Context, sess player.Session, timeout time.Dur
 					decisionMS = 0
 				}
 				return turnInputResult{
-					input: combat.TurnInput{PlayerID: sess.PlayerID, Action: cmd.Action, Target: cmd.Target, DecisionMS: decisionMS},
-					ok:    true,
+					playerID: sess.PlayerID,
+					input:    combat.TurnInput{PlayerID: sess.PlayerID, Action: cmd.Action, Target: cmd.Target, DecisionMS: decisionMS},
+					status:   turnInputAction,
 				}
 			case player.CommandQuit:
 				return turnInputResult{
-					input: combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso},
-					ok:    true,
+					playerID: sess.PlayerID,
+					input:    combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso},
+					status:   turnInputDisconnect,
 				}
 			default:
 				// Non-action commands are ignored during turn collection.
 			}
 		case <-timer.C:
 			return turnInputResult{
-				input: combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso},
-				ok:    true,
+				playerID: sess.PlayerID,
+				input:    combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso},
+				status:   turnInputTimeout,
 			}
 		}
 	}
+}
+
+func resolveTurnInput(
+	state combat.MatchState,
+	slot *matchSlot,
+	result turnInputResult,
+	npcEngine npc.Engine,
+) (combat.TurnInput, string) {
+	input := normalizeTurnInput(result.input, slot.session.PlayerID)
+	switch result.status {
+	case turnInputNPC:
+		slot.npcControlled = true
+		slot.timeoutStreak = 0
+		return input, ""
+	case turnInputAction:
+		slot.timeoutStreak = 0
+		return input, ""
+	case turnInputTimeout:
+		slot.timeoutStreak++
+		if slot.timeoutStreak >= npcTakeoverTimeoutStreak {
+			slot.npcControlled = true
+			slot.timeoutStreak = 0
+			return decideNPCInput(state, slot.session.PlayerID, npcEngine, slot.npcRNG), "timeout"
+		}
+		return input, ""
+	case turnInputDisconnect:
+		slot.npcControlled = true
+		slot.timeoutStreak = 0
+		return decideNPCInput(state, slot.session.PlayerID, npcEngine, slot.npcRNG), "disconnect"
+	default:
+		return combat.TurnInput{PlayerID: slot.session.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso}, ""
+	}
+}
+
+func decideNPCInput(
+	state combat.MatchState,
+	playerID string,
+	npcEngine npc.Engine,
+	rng npc.RandomSource,
+) combat.TurnInput {
+	if npcEngine == nil {
+		return combat.TurnInput{PlayerID: playerID, Action: combat.ActionNone, Target: combat.ZoneTorso}
+	}
+	input, err := npcEngine.Decide(state, playerID, rng)
+	if err != nil {
+		return combat.TurnInput{PlayerID: playerID, Action: combat.ActionNone, Target: combat.ZoneTorso}
+	}
+	return normalizeTurnInput(input, playerID)
+}
+
+func normalizeTurnInput(input combat.TurnInput, playerID string) combat.TurnInput {
+	if input.PlayerID == "" {
+		input.PlayerID = playerID
+	}
+	if input.Target != combat.ZoneHead && input.Target != combat.ZoneTorso && input.Target != combat.ZoneLegs {
+		input.Target = combat.ZoneTorso
+	}
+	switch input.Action {
+	case combat.ActionNone,
+		combat.ActionStrike,
+		combat.ActionGrapple,
+		combat.ActionBlock,
+		combat.ActionDodge,
+		combat.ActionCounter,
+		combat.ActionFeint,
+		combat.ActionBreak:
+		// valid
+	default:
+		input.Action = combat.ActionNone
+	}
+	return input
+}
+
+func findSlotByPlayerID(playerID string, slots ...*matchSlot) *matchSlot {
+	for _, slot := range slots {
+		if slot != nil && slot.session.PlayerID == playerID {
+			return slot
+		}
+	}
+	return nil
 }
 
 func (s *InMemoryService) requeueAfterPairFailure(sess player.Session) {
@@ -447,29 +622,6 @@ func drainSessionInput(sess player.Session) {
 			return
 		}
 	}
-}
-
-func renderFrame(handle1, handle2 string, result combat.TurnResult) []string {
-	s := result.Next
-	lines := []string{
-		fmt.Sprintf("Turn %d", s.Turn),
-		fmt.Sprintf("%s HP:%d ST:%d MO:%d", handle1, s.P1.HP, s.P1.Stamina, s.P1.Momentum),
-		fmt.Sprintf("%s HP:%d ST:%d MO:%d", handle2, s.P2.HP, s.P2.Stamina, s.P2.Momentum),
-	}
-	limit := 3
-	for _, e := range result.Events {
-		if limit == 0 {
-			break
-		}
-		if e.Type == combat.EventActionResolved || e.Type == combat.EventDamageApplied || e.Type == combat.EventMatchFinished {
-			lines = append(lines, fmt.Sprintf("event: %s %s success=%t", e.Type, e.Detail, e.Success))
-			limit--
-		}
-	}
-	if s.Outcome.Finished {
-		lines = append(lines, fmt.Sprintf("Outcome: %s", s.Outcome.Method))
-	}
-	return lines
 }
 
 func mapResult(outcome combat.MatchOutcome) (storage.MatchResultType, *string) {
@@ -540,4 +692,12 @@ func seedForPair(player1ID, player2ID string, now time.Time) uint64 {
 		seed = 1
 	}
 	return seed
+}
+
+func seedWithSalt(seed uint64, salt uint64) uint64 {
+	mixed := seed ^ salt
+	if mixed == 0 {
+		mixed = 1
+	}
+	return mixed
 }
