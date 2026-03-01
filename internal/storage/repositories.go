@@ -2,10 +2,13 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/combat"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/ranking"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -71,6 +74,35 @@ type RatingEntry struct {
 	UpdatedAt   time.Time
 }
 
+type MatchReplayTurnWrite struct {
+	Turn       int
+	RelativeMS int64
+	Inputs     []combat.TurnInput
+	Checksums  combat.TurnChecksum
+}
+
+type MatchReplayWrite struct {
+	Seed         uint64
+	InitialState combat.MatchState
+	Turns        []MatchReplayTurnWrite
+}
+
+type MatchReplayTurn struct {
+	Turn       int
+	RelativeMS int64
+	Inputs     []combat.TurnInput
+	Checksums  combat.TurnChecksum
+	CreatedAt  time.Time
+}
+
+type MatchReplay struct {
+	MatchID      string
+	Seed         uint64
+	InitialState combat.MatchState
+	Turns        []MatchReplayTurn
+	CreatedAt    time.Time
+}
+
 type FinalizeMatchParams struct {
 	MatchID    string
 	Player1ID  string
@@ -79,6 +111,7 @@ type FinalizeMatchParams struct {
 	ResultType MatchResultType
 	StartedAt  time.Time
 	EndedAt    time.Time
+	Replay     *MatchReplayWrite
 }
 
 type FinalizedMatch struct {
@@ -109,6 +142,7 @@ type SeasonRepository interface {
 type MatchRepository interface {
 	CreateMatch(ctx context.Context, match Match) (Match, error)
 	FinalizeMatch(ctx context.Context, params FinalizeMatchParams) (FinalizedMatch, error)
+	GetMatchReplay(ctx context.Context, matchID string) (MatchReplay, error)
 }
 
 type RatingRepository interface {
@@ -324,6 +358,11 @@ func (r *SQLRepositories) FinalizeMatch(ctx context.Context, params FinalizeMatc
 	if err := insertMatchTx(ctx, tx, match); err != nil {
 		return FinalizedMatch{}, err
 	}
+	if params.Replay != nil {
+		if err := insertMatchReplayTx(ctx, tx, match.ID, *params.Replay, createdAt); err != nil {
+			return FinalizedMatch{}, err
+		}
+	}
 
 	if err := insertMatchResultTx(ctx, tx, match.ID, params.Player1ID, params.Player2ID, score1, old1, new1, createdAt); err != nil {
 		return FinalizedMatch{}, err
@@ -365,6 +404,93 @@ func (r *SQLRepositories) FinalizeMatch(ctx context.Context, params FinalizeMatc
 		Player2ID:    params.Player2ID,
 		Player1Score: score1,
 		Player2Score: score2,
+	}, nil
+}
+
+func (r *SQLRepositories) GetMatchReplay(ctx context.Context, matchID string) (MatchReplay, error) {
+	if r.pool == nil {
+		return MatchReplay{}, fmt.Errorf("nil db pool")
+	}
+	if matchID == "" {
+		return MatchReplay{}, fmt.Errorf("match id is required")
+	}
+
+	row := r.pool.QueryRow(ctx,
+		`SELECT seed_text, initial_state_json, created_at
+		 FROM match_replays
+		 WHERE match_id = $1`,
+		matchID,
+	)
+	var seedText string
+	var initialStateJSON []byte
+	var createdAt time.Time
+	if err := row.Scan(&seedText, &initialStateJSON, &createdAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return MatchReplay{}, ErrNotFound
+		}
+		return MatchReplay{}, fmt.Errorf("get match replay: %w", err)
+	}
+
+	seed, err := strconv.ParseUint(seedText, 10, 64)
+	if err != nil {
+		return MatchReplay{}, fmt.Errorf("parse replay seed: %w", err)
+	}
+	var initialState combat.MatchState
+	if err := json.Unmarshal(initialStateJSON, &initialState); err != nil {
+		return MatchReplay{}, fmt.Errorf("decode replay initial state: %w", err)
+	}
+
+	rows, err := r.pool.Query(ctx,
+		`SELECT turn, relative_ms, inputs_json, state_hash_text, roll_hash_text, created_at
+		 FROM match_replay_turns
+		 WHERE match_id = $1
+		 ORDER BY turn ASC`,
+		matchID,
+	)
+	if err != nil {
+		return MatchReplay{}, fmt.Errorf("query replay turns: %w", err)
+	}
+	defer rows.Close()
+
+	turns := make([]MatchReplayTurn, 0, 32)
+	for rows.Next() {
+		var turn MatchReplayTurn
+		var inputsJSON []byte
+		var stateHashText string
+		var rollHashText string
+		if err := rows.Scan(
+			&turn.Turn,
+			&turn.RelativeMS,
+			&inputsJSON,
+			&stateHashText,
+			&rollHashText,
+			&turn.CreatedAt,
+		); err != nil {
+			return MatchReplay{}, fmt.Errorf("scan replay turn: %w", err)
+		}
+		if err := json.Unmarshal(inputsJSON, &turn.Inputs); err != nil {
+			return MatchReplay{}, fmt.Errorf("decode replay turn inputs: %w", err)
+		}
+		turn.Checksums.StateHash, err = strconv.ParseUint(stateHashText, 10, 64)
+		if err != nil {
+			return MatchReplay{}, fmt.Errorf("parse replay state hash: %w", err)
+		}
+		turn.Checksums.RollHash, err = strconv.ParseUint(rollHashText, 10, 64)
+		if err != nil {
+			return MatchReplay{}, fmt.Errorf("parse replay roll hash: %w", err)
+		}
+		turns = append(turns, turn)
+	}
+	if err := rows.Err(); err != nil {
+		return MatchReplay{}, fmt.Errorf("iterate replay turns: %w", err)
+	}
+
+	return MatchReplay{
+		MatchID:      matchID,
+		Seed:         seed,
+		InitialState: initialState,
+		Turns:        turns,
+		CreatedAt:    createdAt,
 	}, nil
 }
 
@@ -548,6 +674,47 @@ func insertMatchTx(ctx context.Context, tx pgx.Tx, m Match) error {
 	if err != nil {
 		return fmt.Errorf("insert match: %w", err)
 	}
+	return nil
+}
+
+func insertMatchReplayTx(ctx context.Context, tx pgx.Tx, matchID string, replay MatchReplayWrite, createdAt time.Time) error {
+	initialStateJSON, err := json.Marshal(replay.InitialState)
+	if err != nil {
+		return fmt.Errorf("encode replay initial state: %w", err)
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO match_replays (
+		   match_id, seed_text, initial_state_json, turn_count, created_at
+		 ) VALUES ($1, $2, $3, $4, $5)`,
+		matchID, strconv.FormatUint(replay.Seed, 10), initialStateJSON, len(replay.Turns), createdAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert match replay: %w", err)
+	}
+
+	for _, turn := range replay.Turns {
+		inputsJSON, err := json.Marshal(turn.Inputs)
+		if err != nil {
+			return fmt.Errorf("encode replay turn inputs (turn %d): %w", turn.Turn, err)
+		}
+		_, err = tx.Exec(ctx,
+			`INSERT INTO match_replay_turns (
+			   match_id, turn, relative_ms, inputs_json, state_hash_text, roll_hash_text, created_at
+			 ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			matchID,
+			turn.Turn,
+			turn.RelativeMS,
+			inputsJSON,
+			strconv.FormatUint(turn.Checksums.StateHash, 10),
+			strconv.FormatUint(turn.Checksums.RollHash, 10),
+			createdAt,
+		)
+		if err != nil {
+			return fmt.Errorf("insert replay turn %d: %w", turn.Turn, err)
+		}
+	}
+
 	return nil
 }
 
