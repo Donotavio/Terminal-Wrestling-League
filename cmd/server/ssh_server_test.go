@@ -26,6 +26,28 @@ type fakeConnMeta struct {
 	addr net.Addr
 }
 
+type scriptedReadWriteCloser struct {
+	reader *strings.Reader
+	writer io.Writer
+}
+
+func newScriptedReadWriteCloser(input string) *scriptedReadWriteCloser {
+	return &scriptedReadWriteCloser{
+		reader: strings.NewReader(input),
+		writer: io.Discard,
+	}
+}
+
+func (s *scriptedReadWriteCloser) Read(p []byte) (int, error) {
+	return s.reader.Read(p)
+}
+
+func (s *scriptedReadWriteCloser) Write(p []byte) (int, error) {
+	return s.writer.Write(p)
+}
+
+func (s *scriptedReadWriteCloser) Close() error { return nil }
+
 func (f fakeConnMeta) User() string          { return f.user }
 func (f fakeConnMeta) SessionID() []byte     { return []byte("sid") }
 func (f fakeConnMeta) ClientVersion() []byte { return []byte("c") }
@@ -127,6 +149,80 @@ func TestLoginRateLimitCallback(t *testing.T) {
 		t.Fatalf("expected rate limit error on 4th attempt")
 	} else if !strings.Contains(strings.ToLower(err.Error()), "rate limit") {
 		t.Fatalf("expected rate limit error, got %v", err)
+	}
+}
+
+func TestRunShellReturnsAfterQuitCommand(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  5 * time.Second,
+		MaxTurns:     120,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	rw := newScriptedReadWriteCloser("quit\n")
+	done := make(chan struct{})
+	go func() {
+		server.runShell(context.Background(), "alice", "127.0.0.1:12345", rw)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("runShell did not return after quit command")
+	}
+}
+
+func TestStartReturnsOnContextCancel(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  100 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Start(ctx)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for server.listener == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if server.listener == nil {
+		t.Fatalf("ssh listener did not start")
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("start returned error after cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Start did not return after context cancellation")
 	}
 }
 

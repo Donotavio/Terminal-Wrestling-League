@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -95,8 +96,18 @@ func (s *sshServer) Start(ctx context.Context) error {
 		return fmt.Errorf("listen on %s: %w", s.cfg.SSHAddr, err)
 	}
 	s.listener = listener
+	stopAccept := make(chan struct{})
+	defer close(stopAccept)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = listener.Close()
+		case <-stopAccept:
+		}
+	}()
 
 	s.matcher.Start(ctx)
+	defer s.matcher.Stop()
 	s.logger.Printf("ssh server listening on %s", s.cfg.SSHAddr)
 
 	for {
@@ -106,6 +117,9 @@ func (s *sshServer) Start(ctx context.Context) error {
 			case <-ctx.Done():
 				return nil
 			default:
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return nil
 			}
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
 				continue
@@ -198,22 +212,32 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 		return
 	}
 	s.trackSession(sess)
+
+	sessionDone := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for {
+			select {
+			case <-sessionDone:
+				return
+			case frame, ok := <-sess.Output:
+				if !ok {
+					return
+				}
+				for _, line := range frame.Lines {
+					_, _ = io.WriteString(rw, line+"\r\n")
+				}
+			}
+		}
+	}()
 	defer func() {
+		close(sessionDone)
+		<-writerDone
 		s.matcher.Dequeue(sess.PlayerID)
 		s.lobby.Unregister(sess.PlayerID)
 		s.untrackSession(sess.PlayerID)
 		close(sess.Input)
-		close(sess.Output)
-	}()
-
-	writerDone := make(chan struct{})
-	go func() {
-		defer close(writerDone)
-		for frame := range sess.Output {
-			for _, line := range frame.Lines {
-				_, _ = io.WriteString(rw, line+"\r\n")
-			}
-		}
 	}()
 
 	s.sendSessionFrame(sess, "Welcome to Terminal Wrestling League!", "Commands: q=join queue, l=leave queue, s=lobby snapshot, a <action> <zone>, quit")
@@ -228,7 +252,6 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 			break
 		}
 	}
-	<-writerDone
 }
 
 func (s *sshServer) handleUserInput(sess player.Session, line string) bool {
