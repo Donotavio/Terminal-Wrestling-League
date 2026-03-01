@@ -2,6 +2,7 @@ package matchmaking
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +35,141 @@ func (m *mockFinalizer) snapshot() (int, []storage.FinalizeMatchParams) {
 	out := make([]storage.FinalizeMatchParams, len(m.params))
 	copy(out, m.params)
 	return m.calls, out
+}
+
+type mockM5Finalizer struct {
+	mu sync.Mutex
+
+	calls      int
+	params     []storage.FinalizeMatchParams
+	turnRows   []storage.MatchTurnTelemetry
+	summaries  []storage.MatchSummaryTelemetry
+	flags      []storage.AntiBotFlag
+	queue      []storage.QueueTelemetryEvent
+	spectator  []storage.SpectatorTelemetryEvent
+	tutorial   []storage.TutorialRun
+	profiles   map[string]storage.PlayerProfile
+	byHandle   map[string]storage.Player
+	antiBotCfg storage.AntiBotConfig
+}
+
+func newMockM5Finalizer() *mockM5Finalizer {
+	return &mockM5Finalizer{
+		profiles:   map[string]storage.PlayerProfile{},
+		byHandle:   map[string]storage.Player{},
+		antiBotCfg: storage.DefaultAntiBotConfig(),
+	}
+}
+
+func (m *mockM5Finalizer) FinalizeMatch(_ context.Context, p storage.FinalizeMatchParams) (storage.FinalizedMatch, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls++
+	m.params = append(m.params, p)
+	return storage.FinalizedMatch{
+		Match: storage.Match{
+			ID:         p.MatchID,
+			WinnerID:   p.WinnerID,
+			ResultType: p.ResultType,
+			DurationMS: int(p.EndedAt.Sub(p.StartedAt).Milliseconds()),
+		},
+		Season:    storage.Season{ID: "season-1"},
+		Player1ID: p.Player1ID,
+		Player2ID: p.Player2ID,
+	}, nil
+}
+
+func (m *mockM5Finalizer) GetByHandle(_ context.Context, handle string) (storage.Player, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	playerEntity, ok := m.byHandle[strings.ToLower(strings.TrimSpace(handle))]
+	if !ok {
+		return storage.Player{}, storage.ErrNotFound
+	}
+	return playerEntity, nil
+}
+
+func (m *mockM5Finalizer) LoadAntiBotConfig(_ context.Context) (storage.AntiBotConfig, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.antiBotCfg, nil
+}
+
+func (m *mockM5Finalizer) CreateAntiBotFlag(_ context.Context, flag storage.AntiBotFlag) (storage.AntiBotFlag, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if flag.ID == "" {
+		flag.ID = fmt.Sprintf("flag-%d", len(m.flags)+1)
+	}
+	m.flags = append(m.flags, flag)
+	return flag, nil
+}
+
+func (m *mockM5Finalizer) InsertTurnTelemetryBatch(_ context.Context, rows []storage.MatchTurnTelemetry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.turnRows = append(m.turnRows, rows...)
+	return nil
+}
+
+func (m *mockM5Finalizer) InsertMatchSummaryTelemetry(_ context.Context, summary storage.MatchSummaryTelemetry) (storage.MatchSummaryTelemetry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.summaries = append(m.summaries, summary)
+	return summary, nil
+}
+
+func (m *mockM5Finalizer) CreateQueueTelemetryEvent(_ context.Context, event storage.QueueTelemetryEvent) (storage.QueueTelemetryEvent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.queue = append(m.queue, event)
+	return event, nil
+}
+
+func (m *mockM5Finalizer) CreateSpectatorTelemetryEvent(_ context.Context, event storage.SpectatorTelemetryEvent) (storage.SpectatorTelemetryEvent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.spectator = append(m.spectator, event)
+	return event, nil
+}
+
+func (m *mockM5Finalizer) CreateTutorialRun(_ context.Context, run storage.TutorialRun) (storage.TutorialRun, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if run.ID == "" {
+		run.ID = fmt.Sprintf("tutorial-%d", len(m.tutorial)+1)
+	}
+	m.tutorial = append(m.tutorial, run)
+	return run, nil
+}
+
+func (m *mockM5Finalizer) MarkTutorialCompleted(_ context.Context, playerID string, now time.Time) (storage.PlayerProfile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	profile := m.profiles[playerID]
+	profile.PlayerID = playerID
+	profile.TutorialCompleted = true
+	profile.TutorialCompletedAt = &now
+	profile.UpdatedAt = now
+	m.profiles[playerID] = profile
+	return profile, nil
+}
+
+func (m *mockM5Finalizer) snapshotM5() (
+	turnRows []storage.MatchTurnTelemetry,
+	summaries []storage.MatchSummaryTelemetry,
+	flags []storage.AntiBotFlag,
+	queue []storage.QueueTelemetryEvent,
+	spectator []storage.SpectatorTelemetryEvent,
+) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	turnRows = append([]storage.MatchTurnTelemetry(nil), m.turnRows...)
+	summaries = append([]storage.MatchSummaryTelemetry(nil), m.summaries...)
+	flags = append([]storage.AntiBotFlag(nil), m.flags...)
+	queue = append([]storage.QueueTelemetryEvent(nil), m.queue...)
+	spectator = append([]storage.SpectatorTelemetryEvent(nil), m.spectator...)
+	return turnRows, summaries, flags, queue, spectator
 }
 
 func makeSession(id, handle string) player.Session {
@@ -180,7 +316,7 @@ func TestRunMatchTakesOverByNPCAfterTwoTimeouts(t *testing.T) {
 		MaxTurns:     2,
 	}, nil)
 
-	svc.runMatch(context.Background(), s1, s2)
+	svc.runMatch(context.Background(), s1, s2, 0, 0)
 
 	_, params := mf.snapshot()
 	if len(params) != 1 || params[0].Replay == nil {
@@ -234,7 +370,7 @@ func TestRunMatchTakesOverByNPCOnDisconnectSameTurn(t *testing.T) {
 		MaxTurns:     1,
 	}, nil)
 
-	svc.runMatch(context.Background(), s1, s2)
+	svc.runMatch(context.Background(), s1, s2, 0, 0)
 
 	_, params := mf.snapshot()
 	if len(params) != 1 || params[0].Replay == nil {
@@ -276,7 +412,7 @@ func TestRunMatchDrawByMaxTurnsPersistsOnce(t *testing.T) {
 		MaxTurns:     1,
 	}, nil)
 
-	svc.runMatch(context.Background(), s1, s2)
+	svc.runMatch(context.Background(), s1, s2, 0, 0)
 
 	calls, params := mf.snapshot()
 	if calls != 1 {
@@ -439,6 +575,193 @@ func TestStopCancelsActiveTurnCollection(t *testing.T) {
 	}
 }
 
+func TestRunMatchPersistsM5TelemetryAndAntiBotFlags(t *testing.T) {
+	lb := lobby.NewInMemoryService()
+	s1 := makeSession("p1", "alice")
+	s2 := makeSession("p2", "bob")
+	if err := lb.Register(s1); err != nil {
+		t.Fatalf("register s1: %v", err)
+	}
+	if err := lb.Register(s2); err != nil {
+		t.Fatalf("register s2: %v", err)
+	}
+
+	now := time.Now().UTC()
+	s1.Input <- player.Command{Kind: player.CommandAction, Action: combat.ActionStrike, Target: combat.ZoneHead, ReceivedAt: now}
+	s2.Input <- player.Command{Kind: player.CommandAction, Action: combat.ActionBlock, Target: combat.ZoneTorso, ReceivedAt: now}
+
+	finalizer := newMockM5Finalizer()
+	svc := NewInMemoryService(lb, finalizer, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  20 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	svc.runMatch(context.Background(), s1, s2, 111, 222)
+
+	turnRows, summaries, flags, _, _ := finalizer.snapshotM5()
+	if len(turnRows) != 2 {
+		t.Fatalf("turn telemetry rows = %d, want 2", len(turnRows))
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("summary rows = %d, want 1", len(summaries))
+	}
+	if summaries[0].QueueWaitMSP1 != 111 || summaries[0].QueueWaitMSP2 != 222 {
+		t.Fatalf("queue waits = (%d,%d), want (111,222)", summaries[0].QueueWaitMSP1, summaries[0].QueueWaitMSP2)
+	}
+	if len(flags) != 2 {
+		t.Fatalf("anti bot flags = %d, want 2", len(flags))
+	}
+}
+
+func TestWatchByHandleAttachesAndStreamsFrames(t *testing.T) {
+	finalizer := newMockM5Finalizer()
+	finalizer.byHandle["alice"] = storage.Player{ID: "p1", Handle: "alice"}
+
+	svc := NewInMemoryService(lobby.NewInMemoryService(), finalizer, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  20 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	match := &activeMatch{
+		MatchID:  "m1",
+		P1ID:     "p1",
+		P2ID:     "p2",
+		P1Handle: "alice",
+		P2Handle: "bob",
+		Done:     make(chan struct{}),
+	}
+	svc.registerActiveMatch(match)
+
+	spectatorSession := makeSession("sp1", "spec")
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.WatchByHandle(context.Background(), spectatorSession, "alice", 2*time.Second, 20)
+	}()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, _, _, _, spectatorEvents := finalizer.snapshotM5()
+		if hasSpectatorEvent(spectatorEvents, "watch_attached") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	svc.spectators.Broadcast("m1", []string{"frame one"})
+	svc.unregisterActiveMatch(match)
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("watch returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("watch did not return after match end")
+	}
+
+	if !sessionOutputContains(spectatorSession, "Watching alice...") {
+		t.Fatalf("missing watch start frame")
+	}
+	if !sessionOutputContains(spectatorSession, "frame one") {
+		t.Fatalf("missing broadcasted frame")
+	}
+	_, _, _, _, spectatorEvents := finalizer.snapshotM5()
+	if !hasSpectatorEvent(spectatorEvents, "watch_requested") ||
+		!hasSpectatorEvent(spectatorEvents, "watch_attached") ||
+		!hasSpectatorEvent(spectatorEvents, "watch_ended") {
+		t.Fatalf("unexpected spectator event set: %+v", spectatorEvents)
+	}
+}
+
+func TestWatchByHandleTimeout(t *testing.T) {
+	finalizer := newMockM5Finalizer()
+	finalizer.byHandle["alice"] = storage.Player{ID: "p1", Handle: "alice"}
+	svc := NewInMemoryService(lobby.NewInMemoryService(), finalizer, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  20 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	spectatorSession := makeSession("sp2", "spec2")
+	err := svc.WatchByHandle(context.Background(), spectatorSession, "alice", 50*time.Millisecond, 20)
+	if err == nil {
+		t.Fatalf("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "no active pvp match") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_, _, _, _, spectatorEvents := finalizer.snapshotM5()
+	if !hasSpectatorEvent(spectatorEvents, "watch_timeout") {
+		t.Fatalf("expected watch_timeout event")
+	}
+}
+
+func TestWatchByHandleRejectsOverCapacity(t *testing.T) {
+	finalizer := newMockM5Finalizer()
+	finalizer.byHandle["alice"] = storage.Player{ID: "p1", Handle: "alice"}
+	svc := NewInMemoryService(lobby.NewInMemoryService(), finalizer, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  20 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	match := &activeMatch{
+		MatchID:  "m2",
+		P1ID:     "p1",
+		P2ID:     "p2",
+		P1Handle: "alice",
+		P2Handle: "bob",
+		Done:     make(chan struct{}),
+	}
+	svc.registerActiveMatch(match)
+	defer svc.unregisterActiveMatch(match)
+
+	if err := svc.spectators.AddWatcher("m2", "existing", make(chan []string, 1), 1); err != nil {
+		t.Fatalf("seed watcher: %v", err)
+	}
+
+	err := svc.WatchByHandle(context.Background(), makeSession("sp3", "spec3"), "alice", 100*time.Millisecond, 1)
+	if err == nil {
+		t.Fatalf("expected capacity rejection")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "capacity") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_, _, _, _, spectatorEvents := finalizer.snapshotM5()
+	if !hasSpectatorEvent(spectatorEvents, "watch_rejected") {
+		t.Fatalf("expected watch_rejected event")
+	}
+}
+
+func TestRunTutorialMarksCompletionAndPersistsRun(t *testing.T) {
+	finalizer := newMockM5Finalizer()
+	svc := NewInMemoryService(lobby.NewInMemoryService(), finalizer, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  20 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	sess := makeSession("p1", "alice")
+	run, err := svc.RunTutorial(context.Background(), sess)
+	if err != nil {
+		t.Fatalf("RunTutorial returned error: %v", err)
+	}
+	if run.PlayerID != "p1" {
+		t.Fatalf("tutorial run player id = %s, want p1", run.PlayerID)
+	}
+
+	finalizer.mu.Lock()
+	defer finalizer.mu.Unlock()
+	if len(finalizer.tutorial) != 1 {
+		t.Fatalf("tutorial runs persisted = %d, want 1", len(finalizer.tutorial))
+	}
+	profile := finalizer.profiles["p1"]
+	if !profile.TutorialCompleted {
+		t.Fatalf("tutorial completed = false, want true")
+	}
+}
+
 func replayInputForPlayer(replay *storage.MatchReplayWrite, turn int, playerID string) (combat.TurnInput, bool) {
 	for _, replayTurn := range replay.Turns {
 		if replayTurn.Turn != turn {
@@ -451,6 +774,15 @@ func replayInputForPlayer(replay *storage.MatchReplayWrite, turn int, playerID s
 		}
 	}
 	return combat.TurnInput{}, false
+}
+
+func hasSpectatorEvent(events []storage.SpectatorTelemetryEvent, eventType string) bool {
+	for _, event := range events {
+		if event.EventType == eventType {
+			return true
+		}
+	}
+	return false
 }
 
 func sessionOutputContains(sess player.Session, needle string) bool {

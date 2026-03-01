@@ -1,25 +1,42 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log"
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/lobby"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/matchmaking"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/player"
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/storage"
 	"golang.org/x/crypto/ssh"
 )
 
 type fakeEnsurer struct{}
 
-func (f *fakeEnsurer) EnsurePlayer(_ context.Context, handle string) (string, error) {
-	return "player-" + handle, nil
+func (f *fakeEnsurer) EnsurePlayerSession(_ context.Context, handle string) (string, storage.PlayerProfile, error) {
+	return "player-" + handle, storage.PlayerProfile{
+		PlayerID:          "player-" + handle,
+		TutorialCompleted: true,
+	}, nil
+}
+
+type fakeTutorialEnsurer struct {
+	completed bool
+}
+
+func (f *fakeTutorialEnsurer) EnsurePlayerSession(_ context.Context, handle string) (string, storage.PlayerProfile, error) {
+	return "player-" + handle, storage.PlayerProfile{
+		PlayerID:          "player-" + handle,
+		TutorialCompleted: f.completed,
+	}, nil
 }
 
 type fakeConnMeta struct {
@@ -29,13 +46,13 @@ type fakeConnMeta struct {
 
 type scriptedReadWriteCloser struct {
 	reader *strings.Reader
-	writer io.Writer
+	mu     sync.Mutex
+	writer bytes.Buffer
 }
 
 func newScriptedReadWriteCloser(input string) *scriptedReadWriteCloser {
 	return &scriptedReadWriteCloser{
 		reader: strings.NewReader(input),
-		writer: io.Discard,
 	}
 }
 
@@ -44,10 +61,18 @@ func (s *scriptedReadWriteCloser) Read(p []byte) (int, error) {
 }
 
 func (s *scriptedReadWriteCloser) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.writer.Write(p)
 }
 
 func (s *scriptedReadWriteCloser) Close() error { return nil }
+
+func (s *scriptedReadWriteCloser) Output() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writer.String()
+}
 
 func (f fakeConnMeta) User() string          { return f.user }
 func (f fakeConnMeta) SessionID() []byte     { return []byte("sid") }
@@ -131,7 +156,7 @@ func TestLoginRateLimitCallback(t *testing.T) {
 		TurnTimeout:  5 * time.Second,
 		MaxTurns:     120,
 	}, nil)
-	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, log.New(io.Discard, "", 0))
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatalf("new ssh server: %v", err)
 	}
@@ -164,7 +189,7 @@ func TestRunShellReturnsAfterQuitCommand(t *testing.T) {
 		TurnTimeout:  5 * time.Second,
 		MaxTurns:     120,
 	}, nil)
-	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, log.New(io.Discard, "", 0))
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatalf("new ssh server: %v", err)
 	}
@@ -194,7 +219,7 @@ func TestActionCommandRequiresActiveMatch(t *testing.T) {
 		TurnTimeout:  5 * time.Second,
 		MaxTurns:     120,
 	}, nil)
-	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, log.New(io.Discard, "", 0))
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatalf("new ssh server: %v", err)
 	}
@@ -205,7 +230,8 @@ func TestActionCommandRequiresActiveMatch(t *testing.T) {
 		Input:    make(chan player.Command, 8),
 		Output:   make(chan player.Frame, 8),
 	}
-	if ok := server.handleUserInput(sess, "a strike head"); !ok {
+	profile := storage.PlayerProfile{PlayerID: "p1", TutorialCompleted: true}
+	if ok := server.handleUserInput(context.Background(), sess, &profile, "a strike head"); !ok {
 		t.Fatalf("action command should not terminate session")
 	}
 
@@ -225,6 +251,121 @@ func TestActionCommandRequiresActiveMatch(t *testing.T) {
 	}
 }
 
+func TestQueueCommandRequiresTutorialCompletion(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  5 * time.Second,
+		MaxTurns:     120,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	sess := player.Session{
+		PlayerID: "p1",
+		Handle:   "alice",
+		Input:    make(chan player.Command, 8),
+		Output:   make(chan player.Frame, 8),
+	}
+	profile := storage.PlayerProfile{PlayerID: "p1", TutorialCompleted: false}
+	if ok := server.handleUserInput(context.Background(), sess, &profile, "q"); !ok {
+		t.Fatalf("queue command should not terminate session")
+	}
+	if len(sess.Input) != 0 {
+		t.Fatalf("queue command should not push direct input")
+	}
+	select {
+	case frame := <-sess.Output:
+		if len(frame.Lines) == 0 || !strings.Contains(strings.ToLower(frame.Lines[0]), "tutorial required") {
+			t.Fatalf("unexpected feedback frame: %+v", frame.Lines)
+		}
+	default:
+		t.Fatalf("expected feedback frame for tutorial gate")
+	}
+}
+
+func TestRunShellFirstLoginForcesTutorial(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  10 * time.Millisecond,
+		MaxTurns:     8,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeTutorialEnsurer{completed: false}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	rw := newScriptedReadWriteCloser("help\na strike head\nq\nquit\n")
+	done := make(chan struct{})
+	go func() {
+		server.runShell(context.Background(), "alice", "127.0.0.1:12345", rw)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("runShell did not return")
+	}
+
+	output := strings.ToLower(rw.Output())
+	if !strings.Contains(output, "tutorial is required") {
+		t.Fatalf("expected mandatory tutorial text, got: %s", output)
+	}
+	if !strings.Contains(output, "tutorial phase 2/2") {
+		t.Fatalf("expected tutorial combat phase text, got: %s", output)
+	}
+}
+
+func TestTutorialRetryRunsTutorialAgain(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  10 * time.Millisecond,
+		MaxTurns:     8,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeTutorialEnsurer{completed: true}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	rw := newScriptedReadWriteCloser("tutorial retry\nhelp\na strike head\nq\nquit\n")
+	done := make(chan struct{})
+	go func() {
+		server.runShell(context.Background(), "alice", "127.0.0.1:12345", rw)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("runShell did not return")
+	}
+
+	output := strings.ToLower(rw.Output())
+	if !strings.Contains(output, "tutorial retry started") {
+		t.Fatalf("expected tutorial retry start text, got: %s", output)
+	}
+	if !strings.Contains(output, "tutorial phase 2/2") {
+		t.Fatalf("expected tutorial combat phase text, got: %s", output)
+	}
+}
+
 func TestStartReturnsOnContextCancel(t *testing.T) {
 	cfg := Config{
 		SSHAddr:  "127.0.0.1:0",
@@ -236,7 +377,7 @@ func TestStartReturnsOnContextCancel(t *testing.T) {
 		TurnTimeout:  100 * time.Millisecond,
 		MaxTurns:     1,
 	}, nil)
-	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, log.New(io.Discard, "", 0))
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatalf("new ssh server: %v", err)
 	}
@@ -282,7 +423,7 @@ func startTestSSHServer(t *testing.T) (*sshServer, string, func()) {
 		MaxTurns:     1,
 	}, nil)
 
-	srv, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, log.New(io.Discard, "", 0))
+	srv, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatalf("new ssh server: %v", err)
 	}
