@@ -16,6 +16,8 @@ const (
 	CommandAction
 	CommandSnapshot
 	CommandQuit
+	CommandWatch
+	CommandTutorialRetry
 )
 
 // Command is one parsed player command from SSH input.

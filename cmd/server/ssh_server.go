@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/lobby"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/matchmaking"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/player"
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/storage"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -27,7 +30,11 @@ type metricRecorder interface {
 }
 
 type playerEnsurer interface {
-	EnsurePlayer(ctx context.Context, handle string) (playerID string, err error)
+	EnsurePlayerSession(ctx context.Context, handle string) (playerID string, profile storage.PlayerProfile, err error)
+}
+
+type sessionTelemetryRecorder interface {
+	RecordSessionEvent(ctx context.Context, event storage.SessionTelemetryEvent) error
 }
 
 type sshServer struct {
@@ -36,6 +43,7 @@ type sshServer struct {
 	matcher   *matchmaking.InMemoryService
 	ensurer   playerEnsurer
 	telemetry metricRecorder
+	sqlEvents sessionTelemetryRecorder
 	logger    *log.Logger
 
 	loginLimiter  *tokenBucketLimiter
@@ -55,6 +63,7 @@ func newSSHServer(
 	matcher *matchmaking.InMemoryService,
 	ensurer playerEnsurer,
 	telemetry metricRecorder,
+	sqlEvents sessionTelemetryRecorder,
 	logger *log.Logger,
 ) (*sshServer, error) {
 	if logger == nil {
@@ -75,6 +84,7 @@ func newSSHServer(
 		matcher:       matcher,
 		ensurer:       ensurer,
 		telemetry:     telemetry,
+		sqlEvents:     sqlEvents,
 		logger:        logger,
 		loginLimiter:  newTokenBucketLimiter(5, 3),
 		queueLimiter:  newTokenBucketLimiter(10, 10),
@@ -193,11 +203,26 @@ RUN:
 }
 
 func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw io.ReadWriteCloser) {
-	playerID, err := s.ensurer.EnsurePlayer(ctx, handle)
+	remoteAddrHash := hashRemoteAddr(remoteAddr)
+	playerID, profile, err := s.ensurer.EnsurePlayerSession(ctx, handle)
 	if err != nil {
+		s.recordSessionEvent(ctx, storage.SessionTelemetryEvent{
+			PlayerID:       nil,
+			Handle:         handle,
+			RemoteAddrHash: remoteAddrHash,
+			EventType:      "login_failed",
+			Detail:         map[string]any{"reason": "ensure_player_session_failed"},
+		})
 		_, _ = io.WriteString(rw, "failed to initialize player\n")
 		return
 	}
+	s.recordSessionEvent(ctx, storage.SessionTelemetryEvent{
+		PlayerID:       &playerID,
+		Handle:         handle,
+		RemoteAddrHash: remoteAddrHash,
+		EventType:      "login_success",
+		Detail:         map[string]any{"tutorial_completed": profile.TutorialCompleted},
+	})
 
 	sess := player.Session{
 		PlayerID:   playerID,
@@ -208,6 +233,13 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 	}
 
 	if err := s.lobby.Register(sess); err != nil {
+		s.recordSessionEvent(ctx, storage.SessionTelemetryEvent{
+			PlayerID:       &playerID,
+			Handle:         handle,
+			RemoteAddrHash: remoteAddrHash,
+			EventType:      "session_register_failed",
+			Detail:         map[string]any{"error": err.Error()},
+		})
 		_, _ = io.WriteString(rw, "failed to register session\n")
 		return
 	}
@@ -238,23 +270,62 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 		s.lobby.Unregister(sess.PlayerID)
 		s.untrackSession(sess.PlayerID)
 		close(sess.Input)
+		s.recordSessionEvent(ctx, storage.SessionTelemetryEvent{
+			PlayerID:       &playerID,
+			Handle:         handle,
+			RemoteAddrHash: remoteAddrHash,
+			EventType:      "session_closed",
+			Detail:         map[string]any{},
+		})
 	}()
 
-	s.sendSessionFrame(sess, "Welcome to Terminal Wrestling League!", "Commands: q=join queue, l=leave queue, s=lobby snapshot, a <action> <zone>, quit")
+	s.sendSessionFrame(sess,
+		"Welcome to Terminal Wrestling League!",
+		"Commands: q=join queue, l=leave queue, s=lobby snapshot, a <action> <zone>, watch <handle>, tutorial retry, quit",
+	)
 
 	scanner := bufio.NewScanner(rw)
+	if !profile.TutorialCompleted {
+		if err := s.runTutorialFlow(ctx, sess, scanner, &profile, false, remoteAddrHash); err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			s.sendSessionFrame(sess, "tutorial aborted: "+err.Error())
+			return
+		}
+	}
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
-		if !s.handleUserInput(sess, line) {
+		if strings.EqualFold(line, "tutorial retry") {
+			if err := s.runTutorialFlow(ctx, sess, scanner, &profile, true, remoteAddrHash); err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				s.sendSessionFrame(sess, "tutorial retry failed: "+err.Error())
+				return
+			}
+			continue
+		}
+		if !s.handleUserInput(ctx, sess, &profile, line) {
 			break
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		s.recordSessionEvent(ctx, storage.SessionTelemetryEvent{
+			PlayerID:       &playerID,
+			Handle:         handle,
+			RemoteAddrHash: remoteAddrHash,
+			EventType:      "session_io_error",
+			Detail:         map[string]any{"error": err.Error()},
+		})
+	}
 }
 
-func (s *sshServer) handleUserInput(sess player.Session, line string) bool {
+func (s *sshServer) handleUserInput(ctx context.Context, sess player.Session, profile *storage.PlayerProfile, line string) bool {
 	fields := strings.Fields(strings.ToLower(line))
 	if len(fields) == 0 {
 		return true
@@ -262,6 +333,10 @@ func (s *sshServer) handleUserInput(sess player.Session, line string) bool {
 
 	switch fields[0] {
 	case "q":
+		if profile != nil && !profile.TutorialCompleted {
+			s.sendSessionFrame(sess, "tutorial required before queue: complete first-time tutorial or run `tutorial retry`")
+			return true
+		}
 		if !s.queueLimiter.Allow(sess.PlayerID) {
 			s.sendSessionFrame(sess, "queue rate limit reached")
 			return true
@@ -281,7 +356,16 @@ func (s *sshServer) handleUserInput(sess player.Session, line string) bool {
 		)
 		return true
 	case "help":
-		s.sendSessionFrame(sess, "Commands: q, l, s, a <action> <zone>, quit")
+		s.sendSessionFrame(sess, "Commands: q, l, s, a <action> <zone>, watch <handle>, tutorial retry, quit")
+		return true
+	case "watch":
+		if len(fields) < 2 {
+			s.sendSessionFrame(sess, "usage: watch <handle>")
+			return true
+		}
+		if err := s.matcher.WatchByHandle(ctx, sess, fields[1], s.cfg.WatchWaitTimeout, s.cfg.SpectatorMaxPerMatch); err != nil {
+			s.sendSessionFrame(sess, "watch error: "+err.Error())
+		}
 		return true
 	case "quit", "exit":
 		now := time.Now().UTC()
@@ -317,6 +401,119 @@ func (s *sshServer) handleUserInput(sess player.Session, line string) bool {
 		s.sendSessionFrame(sess, "unknown command, type help")
 		return true
 	}
+}
+
+func (s *sshServer) runTutorialFlow(
+	ctx context.Context,
+	sess player.Session,
+	scanner *bufio.Scanner,
+	profile *storage.PlayerProfile,
+	retry bool,
+	remoteAddrHash string,
+) error {
+	if scanner == nil {
+		return fmt.Errorf("scanner is required")
+	}
+
+	s.recordSessionEvent(ctx, storage.SessionTelemetryEvent{
+		PlayerID:       &sess.PlayerID,
+		Handle:         sess.Handle,
+		RemoteAddrHash: remoteAddrHash,
+		EventType:      "tutorial_started",
+		Detail:         map[string]any{"retry": retry},
+	})
+
+	if retry {
+		s.sendSessionFrame(sess, "Tutorial retry started.")
+	} else {
+		s.sendSessionFrame(sess, "First login detected: tutorial is required before entering PvP queue.")
+	}
+	s.sendSessionFrame(sess, "Tutorial phase 1/2 (guided): follow the prompts exactly.")
+
+	steps := []struct {
+		Command string
+		Prompt  string
+	}{
+		{
+			Command: "help",
+			Prompt:  "Type `help` and press Enter.",
+		},
+		{
+			Command: "a strike head",
+			Prompt:  "Type `a strike head` and press Enter.",
+		},
+		{
+			Command: "q",
+			Prompt:  "Type `q` and press Enter.",
+		},
+	}
+
+	for _, step := range steps {
+		s.sendSessionFrame(sess, step.Prompt)
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					return err
+				}
+				return io.EOF
+			}
+			line := strings.TrimSpace(strings.ToLower(scanner.Text()))
+			if line == "quit" || line == "exit" {
+				s.sendSessionFrame(sess, "bye")
+				return io.EOF
+			}
+			if line == step.Command {
+				s.sendSessionFrame(sess, "ok")
+				break
+			}
+			s.sendSessionFrame(sess, fmt.Sprintf("tutorial expects `%s`", step.Command))
+		}
+	}
+
+	s.sendSessionFrame(sess, "Tutorial phase 2/2: starting a short fight against training NPC.")
+	run, err := s.matcher.RunTutorial(ctx, sess)
+	if err != nil {
+		s.recordSessionEvent(ctx, storage.SessionTelemetryEvent{
+			PlayerID:       &sess.PlayerID,
+			Handle:         sess.Handle,
+			RemoteAddrHash: remoteAddrHash,
+			EventType:      "tutorial_failed",
+			Detail:         map[string]any{"retry": retry, "error": err.Error()},
+		})
+		return err
+	}
+	if profile != nil {
+		profile.TutorialRuns++
+		if !profile.TutorialCompleted {
+			now := time.Now().UTC()
+			profile.TutorialCompleted = true
+			profile.TutorialCompletedAt = &now
+		}
+	}
+
+	s.recordSessionEvent(ctx, storage.SessionTelemetryEvent{
+		PlayerID:       &sess.PlayerID,
+		Handle:         sess.Handle,
+		RemoteAddrHash: remoteAddrHash,
+		EventType:      "tutorial_completed",
+		Detail: map[string]any{
+			"retry":       retry,
+			"result":      string(run.Result),
+			"duration_ms": run.DurationMS,
+		},
+	})
+
+	if retry {
+		s.sendSessionFrame(sess, fmt.Sprintf("Tutorial retry complete (%s).", run.Result))
+		return nil
+	}
+	s.sendSessionFrame(sess, fmt.Sprintf("Tutorial complete (%s). Queue PvP unlocked.", run.Result))
+	return nil
 }
 
 func parseActionCommand(fields []string) (player.Command, error) {
@@ -426,4 +623,23 @@ func (s *sshServer) sendSessionFrame(sess player.Session, lines ...string) {
 	case sess.Output <- frame:
 	default:
 	}
+}
+
+func (s *sshServer) recordSessionEvent(ctx context.Context, event storage.SessionTelemetryEvent) {
+	if s == nil || s.sqlEvents == nil {
+		return
+	}
+	if event.Detail == nil {
+		event.Detail = map[string]any{}
+	}
+	_ = s.sqlEvents.RecordSessionEvent(ctx, event)
+}
+
+func hashRemoteAddr(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(remoteAddr)
+	}
+	sum := sha256.Sum256([]byte(host))
+	return hex.EncodeToString(sum[:])
 }

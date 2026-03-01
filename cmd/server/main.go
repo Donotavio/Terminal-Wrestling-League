@@ -37,13 +37,14 @@ func main() {
 	repos := storage.NewSQLRepositories(pool, rankingSvc)
 	lobbySvc := lobby.NewInMemoryService()
 	metrics := telemetry.NewInMemoryCollector()
+	sqlTelemetry := telemetry.NewSQLWriter(repos)
 	matchSvc := matchmaking.NewInMemoryService(lobbySvc, repos, matchmaking.MatchConfig{
 		QueueTimeout: cfg.QueueTimeout,
 		TurnTimeout:  cfg.TurnTimeout,
 		MaxTurns:     cfg.MaxTurns,
 	}, metrics)
 
-	srv, err := newSSHServer(cfg, lobbySvc, matchSvc, &sqlPlayerEnsurer{repos: repos}, metrics, log.Default())
+	srv, err := newSSHServer(cfg, lobbySvc, matchSvc, &sqlPlayerEnsurer{repos: repos}, metrics, sqlTelemetry, log.Default())
 	if err != nil {
 		log.Fatalf("create ssh server: %v", err)
 	}

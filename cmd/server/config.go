@@ -10,12 +10,14 @@ import (
 
 // Config holds runtime configuration for the SSH authoritative server.
 type Config struct {
-	DatabaseURL  string
-	SSHAddr      string
-	SSHUsers     map[string]string
-	QueueTimeout time.Duration
-	TurnTimeout  time.Duration
-	MaxTurns     int
+	DatabaseURL          string
+	SSHAddr              string
+	SSHUsers             map[string]string
+	QueueTimeout         time.Duration
+	TurnTimeout          time.Duration
+	MaxTurns             int
+	WatchWaitTimeout     time.Duration
+	SpectatorMaxPerMatch int
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -49,6 +51,14 @@ func LoadConfigFromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	watchWaitTimeoutSec, err := parseIntEnvDefault("TWL_WATCH_WAIT_TIMEOUT_SEC", 120)
+	if err != nil {
+		return Config{}, err
+	}
+	spectatorMaxPerMatch, err := parseIntEnvDefault("TWL_SPECTATOR_MAX_PER_MATCH", 20)
+	if err != nil {
+		return Config{}, err
+	}
 	if maxTurns <= 0 {
 		return Config{}, fmt.Errorf("TWL_MAX_TURNS must be > 0")
 	}
@@ -56,6 +66,8 @@ func LoadConfigFromEnv() (Config, error) {
 	cfg.QueueTimeout = time.Duration(queueTimeoutSec) * time.Second
 	cfg.TurnTimeout = time.Duration(turnTimeoutSec) * time.Second
 	cfg.MaxTurns = maxTurns
+	cfg.WatchWaitTimeout = time.Duration(watchWaitTimeoutSec) * time.Second
+	cfg.SpectatorMaxPerMatch = spectatorMaxPerMatch
 	return cfg, nil
 }
 
