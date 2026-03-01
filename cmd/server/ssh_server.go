@@ -292,6 +292,10 @@ func (s *sshServer) handleUserInput(sess player.Session, line string) bool {
 		s.sendSessionFrame(sess, "bye")
 		return false
 	case "a":
+		if !s.matcher.IsPlayerInMatch(sess.PlayerID) {
+			s.sendSessionFrame(sess, "you are not in an active match")
+			return true
+		}
 		if !s.actionLimiter.Allow(sess.PlayerID) {
 			s.sendSessionFrame(sess, "action rate limit reached")
 			return true

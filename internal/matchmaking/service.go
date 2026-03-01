@@ -66,6 +66,8 @@ type InMemoryService struct {
 
 	nowFn  func() time.Time
 	stopCh chan struct{}
+	runCtx context.Context
+	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
 	mu      sync.Mutex
@@ -91,6 +93,7 @@ func NewInMemoryService(lobbySvc queueLobby, finalizer MatchFinalizer, cfg Match
 		telemetry: telemetry,
 		nowFn:     func() time.Time { return time.Now().UTC() },
 		stopCh:    make(chan struct{}),
+		runCtx:    context.Background(),
 		inMatch:   make(map[string]struct{}),
 	}
 }
@@ -101,11 +104,14 @@ func (s *InMemoryService) Start(ctx context.Context) {
 		s.mu.Unlock()
 		return
 	}
+	runCtx, cancel := context.WithCancel(ctx)
 	s.running = true
+	s.runCtx = runCtx
+	s.cancel = cancel
 	s.mu.Unlock()
 
 	s.wg.Add(1)
-	go s.loop(ctx)
+	go s.loop(runCtx)
 }
 
 func (s *InMemoryService) Stop() {
@@ -115,6 +121,10 @@ func (s *InMemoryService) Stop() {
 		return
 	}
 	s.running = false
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
 	close(s.stopCh)
 	s.mu.Unlock()
 	s.wg.Wait()
@@ -144,6 +154,16 @@ func (s *InMemoryService) Dequeue(playerID string) {
 	if sess, ok := s.lobby.GetSession(playerID); ok {
 		s.sendFrame(sess, "Left queue.")
 	}
+}
+
+func (s *InMemoryService) IsPlayerInMatch(playerID string) bool {
+	if playerID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.inMatch[playerID]
+	return ok
 }
 
 func (s *InMemoryService) loop(ctx context.Context) {
@@ -192,12 +212,19 @@ func (s *InMemoryService) processQueue(now time.Time) {
 	}
 	s.inMatch[pair[0]] = struct{}{}
 	s.inMatch[pair[1]] = struct{}{}
+	matchCtx := s.runCtx
 	s.mu.Unlock()
 
 	sess1, ok1 := s.lobby.GetSession(pair[0])
 	sess2, ok2 := s.lobby.GetSession(pair[1])
 	if !ok1 || !ok2 {
 		s.releasePlayers(pair[0], pair[1])
+		if ok1 {
+			s.requeueAfterPairFailure(sess1)
+		}
+		if ok2 {
+			s.requeueAfterPairFailure(sess2)
+		}
 		return
 	}
 
@@ -206,14 +233,20 @@ func (s *InMemoryService) processQueue(now time.Time) {
 	}
 
 	s.wg.Add(1)
-	go func() {
+	go func(ctx context.Context) {
 		defer s.wg.Done()
-		s.runMatch(sess1, sess2)
+		s.runMatch(ctx, sess1, sess2)
 		s.releasePlayers(pair[0], pair[1])
-	}()
+	}(matchCtx)
 }
 
-func (s *InMemoryService) runMatch(sess1, sess2 player.Session) {
+func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Session) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer drainSessionInput(sess1)
+	defer drainSessionInput(sess2)
+
 	startedAt := s.nowFn()
 	s.sendFrame(sess1, "Match found!", fmt.Sprintf("Opponent: %s", sess2.Handle))
 	s.sendFrame(sess2, "Match found!", fmt.Sprintf("Opponent: %s", sess1.Handle))
@@ -232,21 +265,50 @@ func (s *InMemoryService) runMatch(sess1, sess2 player.Session) {
 	}
 
 	seed := seedForPair(sess1.PlayerID, sess2.PlayerID, startedAt)
-	sim := engine.NewCombatSimulator(combat.NewMatchState(fighter1, fighter2), s.resolver, seed)
+	initialState := combat.NewMatchState(fighter1, fighter2)
+	replayTurns := make([]storage.MatchReplayTurnWrite, 0, s.cfg.MaxTurns)
+	sim := engine.NewCombatSimulator(initialState, s.resolver, seed)
 
 	for turn := 0; turn < s.cfg.MaxTurns; turn++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		state := sim.State()
 		if state.Outcome.Finished {
 			break
 		}
 
-		inputs := s.collectTurnInputs(sess1, sess2)
-		result, err := sim.Step(inputs)
+		inputs, ok := s.collectTurnInputs(ctx, sess1, sess2)
+		if !ok {
+			return
+		}
+		canonicalInputs, err := combat.CanonicalizeInputs(state, inputs)
+		if err != nil {
+			s.sendFrame(sess1, "Match aborted: invalid turn inputs.")
+			s.sendFrame(sess2, "Match aborted: invalid turn inputs.")
+			return
+		}
+
+		result, err := sim.Step(canonicalInputs)
 		if err != nil {
 			s.sendFrame(sess1, "Match aborted: resolution error.")
 			s.sendFrame(sess2, "Match aborted: resolution error.")
 			return
 		}
+		relativeMS := s.nowFn().Sub(startedAt).Milliseconds()
+		if relativeMS < 0 {
+			relativeMS = 0
+		}
+		replayTurns = append(replayTurns, storage.MatchReplayTurnWrite{
+			Turn:       result.Next.Turn,
+			RelativeMS: relativeMS,
+			Inputs:     canonicalInputs,
+			Checksums:  result.Checksums,
+		})
+
 		frame := renderFrame(sess1.Handle, sess2.Handle, result)
 		s.sendFrame(sess1, frame...)
 		s.sendFrame(sess2, frame...)
@@ -261,7 +323,7 @@ func (s *InMemoryService) runMatch(sess1, sess2 player.Session) {
 	}
 
 	if s.finalizer != nil {
-		_, err := s.finalizer.FinalizeMatch(context.Background(), storage.FinalizeMatchParams{
+		_, err := s.finalizer.FinalizeMatch(ctx, storage.FinalizeMatchParams{
 			MatchID:    uuid.NewString(),
 			Player1ID:  sess1.PlayerID,
 			Player2ID:  sess2.PlayerID,
@@ -269,8 +331,16 @@ func (s *InMemoryService) runMatch(sess1, sess2 player.Session) {
 			ResultType: resultType,
 			StartedAt:  startedAt,
 			EndedAt:    endedAt,
+			Replay: &storage.MatchReplayWrite{
+				Seed:         seed,
+				InitialState: initialState,
+				Turns:        replayTurns,
+			},
 		})
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			s.sendFrame(sess1, "Warning: failed to persist match result.")
 			s.sendFrame(sess2, "Warning: failed to persist match result.")
 		}
@@ -295,17 +365,25 @@ func (s *InMemoryService) runMatch(sess1, sess2 player.Session) {
 	}
 }
 
-func (s *InMemoryService) collectTurnInputs(sess1, sess2 player.Session) []combat.TurnInput {
-	results := make(chan combat.TurnInput, 2)
-	go func() { results <- waitForTurnInput(sess1, s.cfg.TurnTimeout) }()
-	go func() { results <- waitForTurnInput(sess2, s.cfg.TurnTimeout) }()
+func (s *InMemoryService) collectTurnInputs(ctx context.Context, sess1, sess2 player.Session) ([]combat.TurnInput, bool) {
+	results := make(chan turnInputResult, 2)
+	go func() { results <- waitForTurnInput(ctx, sess1, s.cfg.TurnTimeout) }()
+	go func() { results <- waitForTurnInput(ctx, sess2, s.cfg.TurnTimeout) }()
 
 	in1 := <-results
 	in2 := <-results
-	return []combat.TurnInput{in1, in2}
+	if !in1.ok || !in2.ok {
+		return nil, false
+	}
+	return []combat.TurnInput{in1.input, in2.input}, true
 }
 
-func waitForTurnInput(sess player.Session, timeout time.Duration) combat.TurnInput {
+type turnInputResult struct {
+	input combat.TurnInput
+	ok    bool
+}
+
+func waitForTurnInput(ctx context.Context, sess player.Session, timeout time.Duration) turnInputResult {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
@@ -314,9 +392,14 @@ func waitForTurnInput(sess player.Session, timeout time.Duration) combat.TurnInp
 
 	for {
 		select {
+		case <-ctx.Done():
+			return turnInputResult{ok: false}
 		case cmd, ok := <-sess.Input:
 			if !ok {
-				return combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso}
+				return turnInputResult{
+					input: combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso},
+					ok:    true,
+				}
 			}
 			switch cmd.Kind {
 			case player.CommandAction:
@@ -324,14 +407,44 @@ func waitForTurnInput(sess player.Session, timeout time.Duration) combat.TurnInp
 				if decisionMS < 0 {
 					decisionMS = 0
 				}
-				return combat.TurnInput{PlayerID: sess.PlayerID, Action: cmd.Action, Target: cmd.Target, DecisionMS: decisionMS}
+				return turnInputResult{
+					input: combat.TurnInput{PlayerID: sess.PlayerID, Action: cmd.Action, Target: cmd.Target, DecisionMS: decisionMS},
+					ok:    true,
+				}
 			case player.CommandQuit:
-				return combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso}
+				return turnInputResult{
+					input: combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso},
+					ok:    true,
+				}
 			default:
 				// Non-action commands are ignored during turn collection.
 			}
 		case <-timer.C:
-			return combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso}
+			return turnInputResult{
+				input: combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionNone, Target: combat.ZoneTorso},
+				ok:    true,
+			}
+		}
+	}
+}
+
+func (s *InMemoryService) requeueAfterPairFailure(sess player.Session) {
+	if err := s.lobby.JoinQueue(sess.PlayerID); err != nil {
+		s.sendFrame(sess, "Opponent unavailable. Re-enter queue with q.")
+		return
+	}
+	s.sendFrame(sess, "Opponent unavailable. You were requeued.")
+}
+
+func drainSessionInput(sess player.Session) {
+	for {
+		select {
+		case _, ok := <-sess.Input:
+			if !ok {
+				return
+			}
+		default:
+			return
 		}
 	}
 }

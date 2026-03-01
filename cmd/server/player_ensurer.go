@@ -6,10 +6,16 @@ import (
 	"fmt"
 
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/storage"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
+type playerRepository interface {
+	GetByHandle(ctx context.Context, handle string) (storage.Player, error)
+	Create(ctx context.Context, handle string) (storage.Player, error)
+}
+
 type sqlPlayerEnsurer struct {
-	repos *storage.SQLRepositories
+	repos playerRepository
 }
 
 func (e *sqlPlayerEnsurer) EnsurePlayer(ctx context.Context, handle string) (string, error) {
@@ -25,7 +31,19 @@ func (e *sqlPlayerEnsurer) EnsurePlayer(ctx context.Context, handle string) (str
 	}
 	created, err := e.repos.Create(ctx, handle)
 	if err != nil {
+		if isUniqueViolation(err) {
+			existing, lookupErr := e.repos.GetByHandle(ctx, handle)
+			if lookupErr == nil {
+				return existing.ID, nil
+			}
+			return "", fmt.Errorf("create player race recovery lookup: %w", lookupErr)
+		}
 		return "", fmt.Errorf("create player: %w", err)
 	}
 	return created.ID, nil
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

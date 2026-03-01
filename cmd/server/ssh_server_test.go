@@ -12,6 +12,7 @@ import (
 
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/lobby"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/matchmaking"
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/player"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -179,6 +180,48 @@ func TestRunShellReturnsAfterQuitCommand(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("runShell did not return after quit command")
+	}
+}
+
+func TestActionCommandRequiresActiveMatch(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  5 * time.Second,
+		MaxTurns:     120,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	sess := player.Session{
+		PlayerID: "p1",
+		Handle:   "alice",
+		Input:    make(chan player.Command, 8),
+		Output:   make(chan player.Frame, 8),
+	}
+	if ok := server.handleUserInput(sess, "a strike head"); !ok {
+		t.Fatalf("action command should not terminate session")
+	}
+
+	select {
+	case cmd := <-sess.Input:
+		t.Fatalf("expected action to be rejected outside active match, got %+v", cmd)
+	default:
+	}
+
+	select {
+	case frame := <-sess.Output:
+		if len(frame.Lines) == 0 || !strings.Contains(strings.ToLower(frame.Lines[0]), "not in an active match") {
+			t.Fatalf("unexpected feedback frame: %+v", frame.Lines)
+		}
+	default:
+		t.Fatalf("expected feedback frame when action is rejected")
 	}
 }
 
