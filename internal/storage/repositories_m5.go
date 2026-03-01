@@ -137,6 +137,36 @@ type SpectatorTelemetryEvent struct {
 	CreatedAt         time.Time
 }
 
+type NavigationState string
+
+const (
+	NavigationStateTutorial  NavigationState = "tutorial"
+	NavigationStateLobby     NavigationState = "lobby"
+	NavigationStateQueue     NavigationState = "queue"
+	NavigationStateMatch     NavigationState = "match"
+	NavigationStateSpectator NavigationState = "spectator"
+)
+
+type NavigationSource string
+
+const (
+	NavigationSourceSystem  NavigationSource = "system"
+	NavigationSourceCommand NavigationSource = "command"
+	NavigationSourceMenu    NavigationSource = "menu"
+)
+
+type NavigationTelemetryEvent struct {
+	ID        string
+	PlayerID  string
+	SessionID *string
+	State     NavigationState
+	EventType string
+	Source    NavigationSource
+	OptionKey *string
+	Detail    map[string]any
+	CreatedAt time.Time
+}
+
 func DefaultAntiBotConfig() AntiBotConfig {
 	return AntiBotConfig{
 		MinDecisions:            12,
@@ -593,6 +623,46 @@ func (r *SQLRepositories) CreateSpectatorTelemetryEvent(ctx context.Context, eve
 	)
 	if err != nil {
 		return SpectatorTelemetryEvent{}, fmt.Errorf("insert spectator telemetry event: %w", err)
+	}
+	return event, nil
+}
+
+func (r *SQLRepositories) CreateNavigationTelemetryEvent(ctx context.Context, event NavigationTelemetryEvent) (NavigationTelemetryEvent, error) {
+	if r.pool == nil {
+		return NavigationTelemetryEvent{}, fmt.Errorf("nil db pool")
+	}
+	if event.PlayerID == "" {
+		return NavigationTelemetryEvent{}, fmt.Errorf("player id is required")
+	}
+	if event.State == "" || event.EventType == "" || event.Source == "" {
+		return NavigationTelemetryEvent{}, fmt.Errorf("state, event type and source are required")
+	}
+	if event.ID == "" {
+		event.ID = uuid.NewString()
+	}
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = r.nowFn()
+	}
+	detailJSON, err := marshalDetail(event.Detail)
+	if err != nil {
+		return NavigationTelemetryEvent{}, err
+	}
+	_, err = r.pool.Exec(ctx,
+		`INSERT INTO telemetry_navigation_events (
+		   id, player_id, session_id, state, event_type, source, option_key, detail_json, created_at
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		event.ID,
+		event.PlayerID,
+		event.SessionID,
+		event.State,
+		event.EventType,
+		event.Source,
+		event.OptionKey,
+		detailJSON,
+		event.CreatedAt.UTC(),
+	)
+	if err != nil {
+		return NavigationTelemetryEvent{}, fmt.Errorf("insert navigation telemetry event: %w", err)
 	}
 	return event, nil
 }

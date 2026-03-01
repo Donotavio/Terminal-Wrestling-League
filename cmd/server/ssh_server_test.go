@@ -79,6 +79,10 @@ func (f *caseSensitiveWatchFinalizer) CreateSpectatorTelemetryEvent(_ context.Co
 	return event, nil
 }
 
+func (f *caseSensitiveWatchFinalizer) CreateNavigationTelemetryEvent(_ context.Context, event storage.NavigationTelemetryEvent) (storage.NavigationTelemetryEvent, error) {
+	return event, nil
+}
+
 func (f *caseSensitiveWatchFinalizer) CreateTutorialRun(_ context.Context, run storage.TutorialRun) (storage.TutorialRun, error) {
 	return run, nil
 }
@@ -125,6 +129,21 @@ func (s *scriptedReadWriteCloser) Output() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.writer.String()
+}
+
+func drainScriptedFrames(sess player.Session) string {
+	var b strings.Builder
+	for {
+		select {
+		case frame := <-sess.Output:
+			for _, line := range frame.Lines {
+				b.WriteString(line)
+				b.WriteByte('\n')
+			}
+		default:
+			return b.String()
+		}
+	}
 }
 
 func (f fakeConnMeta) User() string          { return f.user }
@@ -485,6 +504,115 @@ func TestWatchCommandPreservesTargetHandleCasing(t *testing.T) {
 		}
 	default:
 		t.Fatalf("expected watch feedback frame")
+	}
+}
+
+func TestPlayAliasEnqueuesPlayer(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  5 * time.Second,
+		MaxTurns:     120,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	sess := player.Session{
+		PlayerID: "p1",
+		Handle:   "alice",
+		Input:    make(chan player.Command, 8),
+		Output:   make(chan player.Frame, 16),
+	}
+	if err := lb.Register(sess); err != nil {
+		t.Fatalf("register session: %v", err)
+	}
+	profile := storage.PlayerProfile{PlayerID: "p1", TutorialCompleted: true}
+	if ok := server.handleUserInput(context.Background(), sess, &profile, "play"); !ok {
+		t.Fatalf("play command should not terminate session")
+	}
+	inQueue, _, _ := lb.QueueStatus("p1", time.Now().UTC())
+	if !inQueue {
+		t.Fatalf("expected player to be queued via play alias")
+	}
+}
+
+func TestStatusAndMenuCommandsShowNavigationFrames(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  5 * time.Second,
+		MaxTurns:     120,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeEnsurer{}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	sess := player.Session{
+		PlayerID: "p1",
+		Handle:   "alice",
+		Input:    make(chan player.Command, 8),
+		Output:   make(chan player.Frame, 16),
+	}
+	profile := storage.PlayerProfile{PlayerID: "p1", TutorialCompleted: true}
+
+	if ok := server.handleUserInput(context.Background(), sess, &profile, "status"); !ok {
+		t.Fatalf("status command should not terminate session")
+	}
+	if ok := server.handleUserInput(context.Background(), sess, &profile, "menu"); !ok {
+		t.Fatalf("menu command should not terminate session")
+	}
+
+	output := strings.ToLower(drainScriptedFrames(sess))
+	if !strings.Contains(output, "status: state=lobby") {
+		t.Fatalf("expected status frame, got: %s", output)
+	}
+	if !strings.Contains(output, "menu[lobby]") {
+		t.Fatalf("expected lobby menu frame, got: %s", output)
+	}
+}
+
+func TestRunShellLobbyShortcutOneMapsToPlay(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  10 * time.Millisecond,
+		MaxTurns:     8,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeTutorialEnsurer{completed: true}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	rw := newScriptedReadWriteCloser("1\nquit\n")
+	done := make(chan struct{})
+	go func() {
+		server.runShell(context.Background(), "alice", "127.0.0.1:12345", rw)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatalf("runShell did not return")
+	}
+
+	output := strings.ToLower(rw.Output())
+	if !strings.Contains(output, "entered queue") {
+		t.Fatalf("expected queue join via shortcut, got: %s", output)
 	}
 }
 

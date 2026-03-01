@@ -79,6 +79,44 @@ func TestQueueTimeoutRemovesExpiredPlayers(t *testing.T) {
 	}
 }
 
+func TestQueueStatusReturnsPositionAndWait(t *testing.T) {
+	svc := NewInMemoryService()
+	_ = svc.Register(newSession("p1", "a"))
+	_ = svc.Register(newSession("p2", "b"))
+	_ = svc.Register(newSession("p3", "c"))
+	_ = svc.JoinQueue("p1")
+	_ = svc.JoinQueue("p2")
+	_ = svc.JoinQueue("p3")
+
+	now := time.Now().UTC().Add(2 * time.Second)
+	inQueue, position, wait := svc.QueueStatus("p2", now)
+	if !inQueue {
+		t.Fatalf("expected p2 to be queued")
+	}
+	if position != 2 {
+		t.Fatalf("position = %d, want 2", position)
+	}
+	if wait < 0 {
+		t.Fatalf("wait = %s, want >= 0", wait)
+	}
+}
+
+func TestQueueStatusReturnsNotQueued(t *testing.T) {
+	svc := NewInMemoryService()
+	_ = svc.Register(newSession("p1", "a"))
+
+	inQueue, position, wait := svc.QueueStatus("p1", time.Now().UTC())
+	if inQueue {
+		t.Fatalf("expected p1 not queued")
+	}
+	if position != 0 {
+		t.Fatalf("position = %d, want 0", position)
+	}
+	if wait != 0 {
+		t.Fatalf("wait = %s, want 0", wait)
+	}
+}
+
 func TestUnregisterCleansQueueAndSession(t *testing.T) {
 	svc := NewInMemoryService()
 	_ = svc.Register(newSession("p1", "a"))

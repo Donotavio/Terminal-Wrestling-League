@@ -47,6 +47,7 @@ type mockM5Finalizer struct {
 	flags      []storage.AntiBotFlag
 	queue      []storage.QueueTelemetryEvent
 	spectator  []storage.SpectatorTelemetryEvent
+	navigation []storage.NavigationTelemetryEvent
 	tutorial   []storage.TutorialRun
 	profiles   map[string]storage.PlayerProfile
 	byHandle   map[string]storage.Player
@@ -133,6 +134,13 @@ func (m *mockM5Finalizer) CreateSpectatorTelemetryEvent(_ context.Context, event
 	return event, nil
 }
 
+func (m *mockM5Finalizer) CreateNavigationTelemetryEvent(_ context.Context, event storage.NavigationTelemetryEvent) (storage.NavigationTelemetryEvent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.navigation = append(m.navigation, event)
+	return event, nil
+}
+
 func (m *mockM5Finalizer) CreateTutorialRun(_ context.Context, run storage.TutorialRun) (storage.TutorialRun, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -161,6 +169,7 @@ func (m *mockM5Finalizer) snapshotM5() (
 	flags []storage.AntiBotFlag,
 	queue []storage.QueueTelemetryEvent,
 	spectator []storage.SpectatorTelemetryEvent,
+	navigation []storage.NavigationTelemetryEvent,
 ) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -169,7 +178,8 @@ func (m *mockM5Finalizer) snapshotM5() (
 	flags = append([]storage.AntiBotFlag(nil), m.flags...)
 	queue = append([]storage.QueueTelemetryEvent(nil), m.queue...)
 	spectator = append([]storage.SpectatorTelemetryEvent(nil), m.spectator...)
-	return turnRows, summaries, flags, queue, spectator
+	navigation = append([]storage.NavigationTelemetryEvent(nil), m.navigation...)
+	return turnRows, summaries, flags, queue, spectator, navigation
 }
 
 func makeSession(id, handle string) player.Session {
@@ -551,6 +561,52 @@ func TestProcessQueuePairsPlayersAndPersists(t *testing.T) {
 	}
 }
 
+func TestProcessQueueEmitsQueueMatchedNavigationEvents(t *testing.T) {
+	lb := lobby.NewInMemoryService()
+	s1 := makeSession("p1", "alice")
+	s2 := makeSession("p2", "bob")
+	if err := lb.Register(s1); err != nil {
+		t.Fatalf("register s1: %v", err)
+	}
+	if err := lb.Register(s2); err != nil {
+		t.Fatalf("register s2: %v", err)
+	}
+	if err := lb.JoinQueue("p1"); err != nil {
+		t.Fatalf("join queue p1: %v", err)
+	}
+	if err := lb.JoinQueue("p2"); err != nil {
+		t.Fatalf("join queue p2: %v", err)
+	}
+
+	finalizer := newMockM5Finalizer()
+	svc := NewInMemoryService(lb, finalizer, MatchConfig{
+		QueueTimeout: 10 * time.Second,
+		TurnTimeout:  10 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	svc.processQueue(time.Now().UTC())
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _, _, _, _, navigation := finalizer.snapshotM5()
+		if hasNavigationEvent(navigation, "queue_matched") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, _, _, _, _, navigation := finalizer.snapshotM5()
+	queueMatchedCount := 0
+	for _, ev := range navigation {
+		if ev.EventType == "queue_matched" {
+			queueMatchedCount++
+		}
+	}
+	if queueMatchedCount != 2 {
+		t.Fatalf("queue_matched events = %d, want 2", queueMatchedCount)
+	}
+}
+
 func TestProcessQueueRequeuesAvailablePlayerWhenPeerMissing(t *testing.T) {
 	s1 := makeSession("p1", "alice")
 	lb := &pairFailureLobby{
@@ -666,6 +722,33 @@ func TestStartNPCMatchRunsAndReleasesPlayer(t *testing.T) {
 	}
 }
 
+func TestStartNPCMatchPersistsPracticeStartedNavigation(t *testing.T) {
+	lb := lobby.NewInMemoryService()
+	sess := makeSession("p1", "alice")
+	if err := lb.Register(sess); err != nil {
+		t.Fatalf("register session: %v", err)
+	}
+	finalizer := newMockM5Finalizer()
+	svc := NewInMemoryService(lb, finalizer, MatchConfig{
+		QueueTimeout: 5 * time.Second,
+		TurnTimeout:  10 * time.Millisecond,
+		MaxTurns:     1,
+	}, nil)
+
+	if err := svc.StartNPCMatch(sess); err != nil {
+		t.Fatalf("StartNPCMatch returned error: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && svc.IsPlayerInMatch(sess.PlayerID) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, _, _, _, _, navigation := finalizer.snapshotM5()
+	if !hasNavigationEvent(navigation, "practice_started") {
+		t.Fatalf("expected practice_started navigation event")
+	}
+}
+
 func TestStartNPCMatchRejectsBusyPlayer(t *testing.T) {
 	lb := lobby.NewInMemoryService()
 	sess := makeSession("p1", "alice")
@@ -764,7 +847,7 @@ func TestRunMatchPersistsM5TelemetryAndAntiBotFlags(t *testing.T) {
 
 	svc.runMatch(context.Background(), s1, s2, 111, 222)
 
-	turnRows, summaries, flags, _, _ := finalizer.snapshotM5()
+	turnRows, summaries, flags, _, _, navigation := finalizer.snapshotM5()
 	if len(turnRows) != 2 {
 		t.Fatalf("turn telemetry rows = %d, want 2", len(turnRows))
 	}
@@ -776,6 +859,9 @@ func TestRunMatchPersistsM5TelemetryAndAntiBotFlags(t *testing.T) {
 	}
 	if len(flags) != 2 {
 		t.Fatalf("anti bot flags = %d, want 2", len(flags))
+	}
+	if !hasNavigationEvent(navigation, "pvp_started") {
+		t.Fatalf("expected pvp_started navigation event")
 	}
 }
 
@@ -807,7 +893,7 @@ func TestWatchByHandleAttachesAndStreamsFrames(t *testing.T) {
 
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		_, _, _, _, spectatorEvents := finalizer.snapshotM5()
+		_, _, _, _, spectatorEvents, _ := finalizer.snapshotM5()
 		if hasSpectatorEvent(spectatorEvents, "watch_attached") {
 			break
 		}
@@ -831,7 +917,7 @@ func TestWatchByHandleAttachesAndStreamsFrames(t *testing.T) {
 	if !sessionOutputContains(spectatorSession, "frame one") {
 		t.Fatalf("missing broadcasted frame")
 	}
-	_, _, _, _, spectatorEvents := finalizer.snapshotM5()
+	_, _, _, _, spectatorEvents, _ := finalizer.snapshotM5()
 	if !hasSpectatorEvent(spectatorEvents, "watch_requested") ||
 		!hasSpectatorEvent(spectatorEvents, "watch_attached") ||
 		!hasSpectatorEvent(spectatorEvents, "watch_ended") {
@@ -856,7 +942,7 @@ func TestWatchByHandleTimeout(t *testing.T) {
 	if !strings.Contains(err.Error(), "no active pvp match") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	_, _, _, _, spectatorEvents := finalizer.snapshotM5()
+	_, _, _, _, spectatorEvents, _ := finalizer.snapshotM5()
 	if !hasSpectatorEvent(spectatorEvents, "watch_timeout") {
 		t.Fatalf("expected watch_timeout event")
 	}
@@ -893,7 +979,7 @@ func TestWatchByHandleRejectsOverCapacity(t *testing.T) {
 	if !strings.Contains(strings.ToLower(err.Error()), "capacity") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	_, _, _, _, spectatorEvents := finalizer.snapshotM5()
+	_, _, _, _, spectatorEvents, _ := finalizer.snapshotM5()
 	if !hasSpectatorEvent(spectatorEvents, "watch_rejected") {
 		t.Fatalf("expected watch_rejected event")
 	}
@@ -942,6 +1028,15 @@ func replayInputForPlayer(replay *storage.MatchReplayWrite, turn int, playerID s
 }
 
 func hasSpectatorEvent(events []storage.SpectatorTelemetryEvent, eventType string) bool {
+	for _, event := range events {
+		if event.EventType == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNavigationEvent(events []storage.NavigationTelemetryEvent, eventType string) bool {
 	for _, event := range events {
 		if event.EventType == eventType {
 			return true

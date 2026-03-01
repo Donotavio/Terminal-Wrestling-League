@@ -312,10 +312,24 @@ func TestTelemetryEventsAndSummariesIntegration(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create spectator telemetry event: %v", err)
 	}
+	sessionID := "11111111-1111-1111-1111-111111111111"
+	optionKey := "1"
+	if _, err := repos.CreateNavigationTelemetryEvent(ctx, NavigationTelemetryEvent{
+		PlayerID:  p1.ID,
+		SessionID: &sessionID,
+		State:     NavigationStateLobby,
+		EventType: "menu_selected",
+		Source:    NavigationSourceMenu,
+		OptionKey: &optionKey,
+		Detail:    map[string]any{"resolved_command": "play"},
+	}); err != nil {
+		t.Fatalf("create navigation telemetry event: %v", err)
+	}
 
 	assertTableCount(t, pool, "telemetry_match_turns", 2)
 	assertTableCount(t, pool, "telemetry_match_summaries", 1)
 	assertTableCount(t, pool, "telemetry_session_events", 1)
 	assertTableCount(t, pool, "telemetry_queue_events", 1)
 	assertTableCount(t, pool, "telemetry_spectator_events", 1)
+	assertTableCount(t, pool, "telemetry_navigation_events", 1)
 }

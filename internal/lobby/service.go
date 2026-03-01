@@ -154,6 +154,31 @@ func (s *InMemoryService) GetSession(playerID string) (player.Session, bool) {
 	return sess, ok
 }
 
+// QueueStatus returns whether the player is queued plus queue position and wait duration.
+func (s *InMemoryService) QueueStatus(playerID string, now time.Time) (inQueue bool, position int, wait time.Duration) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	joinedAt, exists := s.queuedAt[playerID]
+	if !exists {
+		return false, 0, 0
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	position = 0
+	for idx, queuedID := range s.queue {
+		if queuedID == playerID {
+			position = idx + 1
+			break
+		}
+	}
+	wait = now.Sub(joinedAt)
+	if wait < 0 {
+		wait = 0
+	}
+	return true, position, wait
+}
+
 func (s *InMemoryService) removeQueueLocked(playerID string) {
 	if _, exists := s.queuedAt[playerID]; !exists {
 		return

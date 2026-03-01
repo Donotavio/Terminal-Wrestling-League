@@ -22,6 +22,7 @@ import (
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/matchmaking"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/player"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/storage"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -38,6 +39,7 @@ type playerEnsurer interface {
 
 type sessionTelemetryRecorder interface {
 	RecordSessionEvent(ctx context.Context, event storage.SessionTelemetryEvent) error
+	RecordNavigationEvent(ctx context.Context, event storage.NavigationTelemetryEvent) error
 }
 
 type sshServer struct {
@@ -234,6 +236,7 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 		Input:      make(chan player.Command, 64),
 		Output:     make(chan player.Frame, 64),
 	}
+	sessionID := uuid.NewString()
 
 	if err := s.lobby.Register(sess); err != nil {
 		s.recordSessionEvent(ctx, storage.SessionTelemetryEvent{
@@ -284,13 +287,21 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 
 	s.sendSessionFrame(sess,
 		"Welcome to Terminal Wrestling League!",
-		"Commands: q=join queue, l=leave queue, s=lobby snapshot, npc=practice vs bot, a <action> <zone>, watch <handle>, tutorial retry, quit",
+		"Commands: menu, status, play, q, l, s, npc, a <action> <zone>, watch <handle>, tutorial retry, help, quit",
 	)
+	s.recordNavigationEvent(ctx, storage.NavigationTelemetryEvent{
+		PlayerID:  sess.PlayerID,
+		SessionID: &sessionID,
+		State:     s.navigationState(sess, &profile),
+		EventType: "session_started",
+		Source:    storage.NavigationSourceSystem,
+		Detail:    map[string]any{"tutorial_completed": profile.TutorialCompleted},
+	})
 
 	scanner := bufio.NewScanner(rw)
 	scanner.Split(splitCRLF)
 	if !profile.TutorialCompleted {
-		if err := s.runTutorialFlow(ctx, sess, scanner, &profile, false, remoteAddrHash); err != nil {
+		if err := s.runTutorialFlow(ctx, sess, scanner, &profile, false, remoteAddrHash, sessionID, storage.NavigationSourceSystem); err != nil {
 			if errors.Is(err, io.EOF) {
 				return
 			}
@@ -298,23 +309,44 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 			return
 		}
 	}
+	s.sendStatusAndMenu(ctx, sess, &profile, sessionID)
 
 	for scanner.Scan() {
 		line := sanitizeInputLine(scanner.Text())
 		if line == "" {
 			continue
 		}
+		state := s.navigationState(sess, &profile)
+		retrySource := storage.NavigationSourceCommand
+		if mappedCmd, optionKey, mapped := menuSelectionForState(state, line); mapped {
+			retrySource = storage.NavigationSourceMenu
+			s.recordNavigationEvent(ctx, storage.NavigationTelemetryEvent{
+				PlayerID:  sess.PlayerID,
+				SessionID: &sessionID,
+				State:     state,
+				EventType: "menu_selected",
+				Source:    storage.NavigationSourceMenu,
+				OptionKey: &optionKey,
+				Detail:    map[string]any{"resolved_command": mappedCmd},
+			})
+			if mappedCmd == "__action_hint" {
+				s.sendSessionFrame(sess, "During a match use: a <action> <zone>")
+				continue
+			}
+			line = mappedCmd
+		}
 		if strings.EqualFold(line, "tutorial retry") {
-			if err := s.runTutorialFlow(ctx, sess, scanner, &profile, true, remoteAddrHash); err != nil {
+			if err := s.runTutorialFlow(ctx, sess, scanner, &profile, true, remoteAddrHash, sessionID, retrySource); err != nil {
 				if errors.Is(err, io.EOF) {
 					return
 				}
 				s.sendSessionFrame(sess, "tutorial retry failed: "+err.Error())
 				return
 			}
+			s.sendStatusAndMenu(ctx, sess, &profile, sessionID)
 			continue
 		}
-		if !s.handleUserInput(ctx, sess, &profile, line) {
+		if !s.handleUserInputWithSession(ctx, sess, &profile, line, sessionID) {
 			break
 		}
 	}
@@ -330,14 +362,26 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 }
 
 func (s *sshServer) handleUserInput(ctx context.Context, sess player.Session, profile *storage.PlayerProfile, line string) bool {
+	return s.handleUserInputWithSession(ctx, sess, profile, line, "")
+}
+
+func (s *sshServer) handleUserInputWithSession(
+	ctx context.Context,
+	sess player.Session,
+	profile *storage.PlayerProfile,
+	line string,
+	sessionID string,
+) bool {
 	fields := strings.Fields(strings.TrimSpace(line))
 	if len(fields) == 0 {
 		return true
 	}
 	command := strings.ToLower(fields[0])
+	stateBefore := s.navigationState(sess, profile)
 
 	switch command {
-	case "q":
+	case "q", "play":
+		defer s.sendStatusAndMenu(ctx, sess, profile, sessionID)
 		if profile != nil && !profile.TutorialCompleted {
 			s.sendSessionFrame(sess, "tutorial required before queue: complete first-time tutorial or run `tutorial retry`")
 			return true
@@ -348,10 +392,28 @@ func (s *sshServer) handleUserInput(ctx context.Context, sess player.Session, pr
 		}
 		if err := s.matcher.Enqueue(sess.PlayerID); err != nil {
 			s.sendSessionFrame(sess, "queue error: "+err.Error())
+			return true
 		}
+		s.recordNavigationEvent(ctx, storage.NavigationTelemetryEvent{
+			PlayerID:  sess.PlayerID,
+			SessionID: optionalStringPointer(sessionID),
+			State:     storage.NavigationStateQueue,
+			EventType: "queue_joined",
+			Source:    storage.NavigationSourceCommand,
+			Detail:    map[string]any{"via": command},
+		})
 		return true
 	case "l":
+		defer s.sendStatusAndMenu(ctx, sess, profile, sessionID)
 		s.matcher.Dequeue(sess.PlayerID)
+		s.recordNavigationEvent(ctx, storage.NavigationTelemetryEvent{
+			PlayerID:  sess.PlayerID,
+			SessionID: optionalStringPointer(sessionID),
+			State:     storage.NavigationStateQueue,
+			EventType: "queue_left",
+			Source:    storage.NavigationSourceCommand,
+			Detail:    map[string]any{"via": "l"},
+		})
 		return true
 	case "s":
 		snap := s.lobby.Snapshot()
@@ -360,10 +422,25 @@ func (s *sshServer) handleUserInput(ctx context.Context, sess player.Session, pr
 			fmt.Sprintf("players=%s", strings.Join(snap.Players, ",")),
 		)
 		return true
+	case "status":
+		s.sendStatusFrame(ctx, sess, profile, sessionID, storage.NavigationSourceCommand)
+		return true
+	case "menu":
+		s.sendMenuFrame(ctx, sess, profile, sessionID, storage.NavigationSourceCommand)
+		return true
 	case "help":
-		s.sendSessionFrame(sess, "Commands: q, l, s, npc, a <action> <zone>, watch <handle>, tutorial retry, quit")
+		s.sendSessionFrame(sess, "Commands: menu, status, play, q, l, s, npc, a <action> <zone>, watch <handle>, tutorial retry, help, quit")
+		s.recordNavigationEvent(ctx, storage.NavigationTelemetryEvent{
+			PlayerID:  sess.PlayerID,
+			SessionID: optionalStringPointer(sessionID),
+			State:     stateBefore,
+			EventType: "help_shown",
+			Source:    storage.NavigationSourceCommand,
+			Detail:    map[string]any{"via": "help"},
+		})
 		return true
 	case "npc":
+		defer s.sendStatusAndMenu(ctx, sess, profile, sessionID)
 		if profile != nil && !profile.TutorialCompleted {
 			s.sendSessionFrame(sess, "tutorial required before npc practice: complete first-time tutorial or run `tutorial retry`")
 			return true
@@ -373,6 +450,7 @@ func (s *sshServer) handleUserInput(ctx context.Context, sess player.Session, pr
 		}
 		return true
 	case "watch":
+		defer s.sendStatusAndMenu(ctx, sess, profile, sessionID)
 		if len(fields) < 2 {
 			s.sendSessionFrame(sess, "usage: watch <handle>")
 			return true
@@ -418,6 +496,14 @@ func (s *sshServer) handleUserInput(ctx context.Context, sess player.Session, pr
 		return true
 	default:
 		s.sendSessionFrame(sess, "unknown command, type help")
+		s.recordNavigationEvent(ctx, storage.NavigationTelemetryEvent{
+			PlayerID:  sess.PlayerID,
+			SessionID: optionalStringPointer(sessionID),
+			State:     stateBefore,
+			EventType: "command_invalid",
+			Source:    storage.NavigationSourceCommand,
+			Detail:    map[string]any{"token": command},
+		})
 		return true
 	}
 }
@@ -429,6 +515,8 @@ func (s *sshServer) runTutorialFlow(
 	profile *storage.PlayerProfile,
 	retry bool,
 	remoteAddrHash string,
+	sessionID string,
+	source storage.NavigationSource,
 ) error {
 	if scanner == nil {
 		return fmt.Errorf("scanner is required")
@@ -440,6 +528,14 @@ func (s *sshServer) runTutorialFlow(
 		RemoteAddrHash: remoteAddrHash,
 		EventType:      "tutorial_started",
 		Detail:         map[string]any{"retry": retry},
+	})
+	s.recordNavigationEvent(ctx, storage.NavigationTelemetryEvent{
+		PlayerID:  sess.PlayerID,
+		SessionID: optionalStringPointer(sessionID),
+		State:     storage.NavigationStateTutorial,
+		EventType: "tutorial_started",
+		Source:    source,
+		Detail:    map[string]any{"retry": retry},
 	})
 
 	if retry {
@@ -520,6 +616,18 @@ func (s *sshServer) runTutorialFlow(
 		Handle:         sess.Handle,
 		RemoteAddrHash: remoteAddrHash,
 		EventType:      "tutorial_completed",
+		Detail: map[string]any{
+			"retry":       retry,
+			"result":      string(run.Result),
+			"duration_ms": run.DurationMS,
+		},
+	})
+	s.recordNavigationEvent(ctx, storage.NavigationTelemetryEvent{
+		PlayerID:  sess.PlayerID,
+		SessionID: optionalStringPointer(sessionID),
+		State:     storage.NavigationStateTutorial,
+		EventType: "tutorial_completed",
+		Source:    source,
 		Detail: map[string]any{
 			"retry":       retry,
 			"result":      string(run.Result),
@@ -652,6 +760,171 @@ func (s *sshServer) recordSessionEvent(ctx context.Context, event storage.Sessio
 		event.Detail = map[string]any{}
 	}
 	_ = s.sqlEvents.RecordSessionEvent(ctx, event)
+}
+
+func (s *sshServer) recordNavigationEvent(ctx context.Context, event storage.NavigationTelemetryEvent) {
+	if s == nil || s.sqlEvents == nil {
+		return
+	}
+	if event.Detail == nil {
+		event.Detail = map[string]any{}
+	}
+	_ = s.sqlEvents.RecordNavigationEvent(ctx, event)
+}
+
+func (s *sshServer) sendStatusAndMenu(ctx context.Context, sess player.Session, profile *storage.PlayerProfile, sessionID string) {
+	s.sendStatusFrame(ctx, sess, profile, sessionID, storage.NavigationSourceSystem)
+	s.sendMenuFrame(ctx, sess, profile, sessionID, storage.NavigationSourceSystem)
+}
+
+func (s *sshServer) sendStatusFrame(
+	ctx context.Context,
+	sess player.Session,
+	profile *storage.PlayerProfile,
+	sessionID string,
+	source storage.NavigationSource,
+) {
+	now := time.Now().UTC()
+	state := s.navigationState(sess, profile)
+	snap := s.lobby.Snapshot()
+	inQueue, position, wait := s.lobby.QueueStatus(sess.PlayerID, now)
+	inMatch := s.matcher.IsPlayerInMatch(sess.PlayerID)
+	lines := []string{
+		fmt.Sprintf("status: state=%s online=%d in_queue=%d in_match=%t", state, snap.Online, snap.InQueue, inMatch),
+	}
+	if inQueue {
+		lines = append(lines, fmt.Sprintf("queue: position=%d wait_s=%.1f", position, wait.Seconds()))
+	} else {
+		lines = append(lines, "queue: not queued")
+	}
+	s.sendSessionFrame(sess, lines...)
+	s.recordNavigationEvent(ctx, storage.NavigationTelemetryEvent{
+		PlayerID:  sess.PlayerID,
+		SessionID: optionalStringPointer(sessionID),
+		State:     state,
+		EventType: "status_shown",
+		Source:    source,
+		Detail: map[string]any{
+			"in_queue": inQueue,
+			"position": position,
+			"wait_ms":  wait.Milliseconds(),
+		},
+	})
+}
+
+func (s *sshServer) sendMenuFrame(
+	ctx context.Context,
+	sess player.Session,
+	profile *storage.PlayerProfile,
+	sessionID string,
+	source storage.NavigationSource,
+) {
+	state := s.navigationState(sess, profile)
+	lines := menuLinesForState(state)
+	s.sendSessionFrame(sess, lines...)
+	s.recordNavigationEvent(ctx, storage.NavigationTelemetryEvent{
+		PlayerID:  sess.PlayerID,
+		SessionID: optionalStringPointer(sessionID),
+		State:     state,
+		EventType: "menu_shown",
+		Source:    source,
+		Detail:    map[string]any{},
+	})
+}
+
+func (s *sshServer) navigationState(sess player.Session, profile *storage.PlayerProfile) storage.NavigationState {
+	if profile != nil && !profile.TutorialCompleted {
+		return storage.NavigationStateTutorial
+	}
+	if s.matcher.IsPlayerInMatch(sess.PlayerID) {
+		return storage.NavigationStateMatch
+	}
+	inQueue, _, _ := s.lobby.QueueStatus(sess.PlayerID, time.Now().UTC())
+	if inQueue {
+		return storage.NavigationStateQueue
+	}
+	return storage.NavigationStateLobby
+}
+
+func menuLinesForState(state storage.NavigationState) []string {
+	switch state {
+	case storage.NavigationStateTutorial:
+		return []string{
+			"menu[tutorial]: [1] tutorial retry  [2] help  [3] quit",
+		}
+	case storage.NavigationStateQueue:
+		return []string{
+			"menu[queue]: [1] leave queue  [2] status  [3] help  [4] quit",
+		}
+	case storage.NavigationStateMatch:
+		return []string{
+			"menu[match]: [1] action hint",
+		}
+	case storage.NavigationStateSpectator:
+		return []string{
+			"menu[spectator]: [1] help",
+		}
+	default:
+		return []string{
+			"menu[lobby]: [1] play  [2] npc  [3] status  [4] help  [5] quit",
+		}
+	}
+}
+
+func menuSelectionForState(state storage.NavigationState, raw string) (resolvedCommand string, optionKey string, ok bool) {
+	optionKey = strings.TrimSpace(raw)
+	switch state {
+	case storage.NavigationStateTutorial:
+		switch optionKey {
+		case "1":
+			return "tutorial retry", optionKey, true
+		case "2":
+			return "help", optionKey, true
+		case "3":
+			return "quit", optionKey, true
+		}
+	case storage.NavigationStateLobby:
+		switch optionKey {
+		case "1":
+			return "play", optionKey, true
+		case "2":
+			return "npc", optionKey, true
+		case "3":
+			return "status", optionKey, true
+		case "4":
+			return "help", optionKey, true
+		case "5":
+			return "quit", optionKey, true
+		}
+	case storage.NavigationStateQueue:
+		switch optionKey {
+		case "1":
+			return "l", optionKey, true
+		case "2":
+			return "status", optionKey, true
+		case "3":
+			return "help", optionKey, true
+		case "4":
+			return "quit", optionKey, true
+		}
+	case storage.NavigationStateMatch:
+		if optionKey == "1" {
+			return "__action_hint", optionKey, true
+		}
+	case storage.NavigationStateSpectator:
+		if optionKey == "1" {
+			return "help", optionKey, true
+		}
+	}
+	return "", "", false
+}
+
+func optionalStringPointer(v string) *string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	return &v
 }
 
 func hashRemoteAddr(remoteAddr string) string {

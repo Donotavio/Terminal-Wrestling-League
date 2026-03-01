@@ -57,6 +57,7 @@ type m5TelemetryStore interface {
 	GetByHandle(ctx context.Context, handle string) (storage.Player, error)
 	LoadAntiBotConfig(ctx context.Context) (storage.AntiBotConfig, error)
 	CreateAntiBotFlag(ctx context.Context, flag storage.AntiBotFlag) (storage.AntiBotFlag, error)
+	CreateNavigationTelemetryEvent(ctx context.Context, event storage.NavigationTelemetryEvent) (storage.NavigationTelemetryEvent, error)
 	InsertTurnTelemetryBatch(ctx context.Context, rows []storage.MatchTurnTelemetry) error
 	InsertMatchSummaryTelemetry(ctx context.Context, summary storage.MatchSummaryTelemetry) (storage.MatchSummaryTelemetry, error)
 	CreateQueueTelemetryEvent(ctx context.Context, event storage.QueueTelemetryEvent) (storage.QueueTelemetryEvent, error)
@@ -262,6 +263,13 @@ func (s *InMemoryService) StartNPCMatch(sess player.Session) error {
 		"Practice match started against Coach NPC.",
 		"Send actions with: a <action> <zone>",
 	)
+	s.persistNavigationEvent(context.Background(), storage.NavigationTelemetryEvent{
+		PlayerID:  sess.PlayerID,
+		State:     storage.NavigationStateLobby,
+		EventType: "practice_started",
+		Source:    storage.NavigationSourceSystem,
+		Detail:    map[string]any{"mode": "npc"},
+	})
 	if s.telemetry != nil {
 		s.telemetry.IncCounter("npc_matches_started")
 	}
@@ -341,6 +349,26 @@ func (s *InMemoryService) processQueue(now time.Time) {
 		EventType:   "matched",
 		QueueWaitMS: waitP2,
 	})
+	s.persistNavigationEvent(context.Background(), storage.NavigationTelemetryEvent{
+		PlayerID:  pair[0],
+		State:     storage.NavigationStateQueue,
+		EventType: "queue_matched",
+		Source:    storage.NavigationSourceSystem,
+		Detail: map[string]any{
+			"queue_wait_ms": waitP1,
+			"opponent_id":   pair[1],
+		},
+	})
+	s.persistNavigationEvent(context.Background(), storage.NavigationTelemetryEvent{
+		PlayerID:  pair[1],
+		State:     storage.NavigationStateQueue,
+		EventType: "queue_matched",
+		Source:    storage.NavigationSourceSystem,
+		Detail: map[string]any{
+			"queue_wait_ms": waitP2,
+			"opponent_id":   pair[0],
+		},
+	})
 
 	s.mu.Lock()
 	if _, busy := s.inMatch[pair[0]]; busy {
@@ -391,6 +419,24 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 	startedAt := s.nowFn()
 	s.sendFrame(sess1, "Match found!", fmt.Sprintf("Opponent: %s", sess2.Handle))
 	s.sendFrame(sess2, "Match found!", fmt.Sprintf("Opponent: %s", sess1.Handle))
+	s.persistNavigationEvent(context.Background(), storage.NavigationTelemetryEvent{
+		PlayerID:  sess1.PlayerID,
+		State:     storage.NavigationStateMatch,
+		EventType: "pvp_started",
+		Source:    storage.NavigationSourceSystem,
+		Detail: map[string]any{
+			"opponent_id": sess2.PlayerID,
+		},
+	})
+	s.persistNavigationEvent(context.Background(), storage.NavigationTelemetryEvent{
+		PlayerID:  sess2.PlayerID,
+		State:     storage.NavigationStateMatch,
+		EventType: "pvp_started",
+		Source:    storage.NavigationSourceSystem,
+		Detail: map[string]any{
+			"opponent_id": sess1.PlayerID,
+		},
+	})
 
 	fighter1, err := combat.NewFighter(sess1.PlayerID, pickArchetype(sess1.PlayerID, 0))
 	if err != nil {
@@ -1121,6 +1167,16 @@ func (s *InMemoryService) persistQueueEvent(ctx context.Context, event storage.Q
 		return
 	}
 	_, _ = s.m5Store.CreateQueueTelemetryEvent(ctx, event)
+}
+
+func (s *InMemoryService) persistNavigationEvent(ctx context.Context, event storage.NavigationTelemetryEvent) {
+	if s.m5Store == nil {
+		return
+	}
+	if event.Detail == nil {
+		event.Detail = map[string]any{}
+	}
+	_, _ = s.m5Store.CreateNavigationTelemetryEvent(ctx, event)
 }
 
 func (s *InMemoryService) registerActiveMatch(match *activeMatch) {

@@ -11,6 +11,7 @@ Current implemented milestones:
 - M3: lobby/matchmaking and SSH runtime
 - M4: replay persistence, animation renderer, deterministic NPC takeover
 - M5: persistent telemetry, anti-bot scoring, tutorial gate, spectator mode
+- M6: hybrid CLI/menu navigation and journey telemetry
 
 ## Core Architecture
 
@@ -53,6 +54,8 @@ The project enforces deterministic combat behavior:
 - Mandatory first-session tutorial gate before queue unlock
 - Optional tutorial replay command (`tutorial retry`)
 - Spectator attach by handle (`watch <handle>`) for active PvP matches
+- Hybrid navigation layer with `menu`, `status`, `play` and numeric shortcuts per state
+- Persistent navigation telemetry (`telemetry_navigation_events`) for UX funnel analysis
 
 ## Requirements
 
@@ -105,6 +108,9 @@ ssh alice@127.0.0.1 -p 2222
 
 ## Gameplay Command Reference
 
+- `menu`: show contextual shortcut menu
+- `status`: show session state, queue status and lobby totals
+- `play`: join queue (alias to `q`)
 - `q`: join queue
 - `l`: leave queue
 - `s`: lobby snapshot
@@ -114,6 +120,13 @@ ssh alice@127.0.0.1 -p 2222
 - `tutorial retry`: rerun tutorial flow
 - `help`: show command summary
 - `quit` or `exit`: close session
+
+Numeric menu shortcuts:
+
+- Tutorial: `1=tutorial retry`, `2=help`, `3=quit`
+- Lobby: `1=play`, `2=npc`, `3=status`, `4=help`, `5=quit`
+- Queue: `1=leave queue`, `2=status`, `3=help`, `4=quit`
+- Match: `1=action hint`
 
 Action values:
 
@@ -156,3 +169,4 @@ See [LICENSE](LICENSE).
 - [M3 SSH protocol and runtime configuration](docs/m3-ssh-protocol.md)
 - [M4 replay persistence and animation/NPC notes](docs/m4-replay-persistence.md)
 - [M5 telemetry, anti-bot, tutorial and spectator notes](docs/m5-telemetry-antibot-tutorial-spectator.md)
+- [M6 navigation and onboarding notes](docs/m6-navigation-onboarding.md)

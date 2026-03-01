@@ -11,6 +11,7 @@ type sqlWriterStore interface {
 	CreateSessionTelemetryEvent(ctx context.Context, event storage.SessionTelemetryEvent) (storage.SessionTelemetryEvent, error)
 	CreateQueueTelemetryEvent(ctx context.Context, event storage.QueueTelemetryEvent) (storage.QueueTelemetryEvent, error)
 	CreateSpectatorTelemetryEvent(ctx context.Context, event storage.SpectatorTelemetryEvent) (storage.SpectatorTelemetryEvent, error)
+	CreateNavigationTelemetryEvent(ctx context.Context, event storage.NavigationTelemetryEvent) (storage.NavigationTelemetryEvent, error)
 	InsertTurnTelemetryBatch(ctx context.Context, rows []storage.MatchTurnTelemetry) error
 	InsertMatchSummaryTelemetry(ctx context.Context, summary storage.MatchSummaryTelemetry) (storage.MatchSummaryTelemetry, error)
 	CreateAntiBotFlag(ctx context.Context, flag storage.AntiBotFlag) (storage.AntiBotFlag, error)
@@ -51,6 +52,16 @@ func (w *SQLWriter) RecordSpectatorEvent(ctx context.Context, event storage.Spec
 	}
 	if _, err := w.store.CreateSpectatorTelemetryEvent(ctx, event); err != nil {
 		return fmt.Errorf("record spectator telemetry event: %w", err)
+	}
+	return nil
+}
+
+func (w *SQLWriter) RecordNavigationEvent(ctx context.Context, event storage.NavigationTelemetryEvent) error {
+	if w == nil || w.store == nil {
+		return nil
+	}
+	if _, err := w.store.CreateNavigationTelemetryEvent(ctx, event); err != nil {
+		return fmt.Errorf("record navigation telemetry event: %w", err)
 	}
 	return nil
 }

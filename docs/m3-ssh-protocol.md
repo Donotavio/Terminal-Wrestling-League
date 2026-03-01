@@ -31,6 +31,9 @@ If `TWL_DATABASE_URL` is missing or invalid, startup fails.
 
 After login, users can run:
 
+- `menu`: show contextual shortcut menu
+- `status`: show current navigation/queue status
+- `play`: join matchmaking queue (alias of `q`)
 - `q`: join matchmaking queue
 - `l`: leave queue
 - `s`: show lobby snapshot
