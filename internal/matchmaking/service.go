@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +15,9 @@ import (
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/lobby"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/npc"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/player"
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/spectator"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/storage"
+	telemetrypkg "github.com/Donotavio/Terminal-Wrestling-League/internal/telemetry"
 	"github.com/google/uuid"
 )
 
@@ -24,6 +27,8 @@ type Service interface {
 	Stop()
 	Enqueue(playerID string) error
 	Dequeue(playerID string)
+	RunTutorial(ctx context.Context, sess player.Session) (storage.TutorialRun, error)
+	WatchByHandle(ctx context.Context, spectatorSession player.Session, targetHandle string, waitTimeout time.Duration, maxSpectators int) error
 }
 
 // MatchConfig controls queue and match timings.
@@ -47,6 +52,18 @@ type MatchFinalizer interface {
 	FinalizeMatch(ctx context.Context, params storage.FinalizeMatchParams) (storage.FinalizedMatch, error)
 }
 
+type m5TelemetryStore interface {
+	GetByHandle(ctx context.Context, handle string) (storage.Player, error)
+	LoadAntiBotConfig(ctx context.Context) (storage.AntiBotConfig, error)
+	CreateAntiBotFlag(ctx context.Context, flag storage.AntiBotFlag) (storage.AntiBotFlag, error)
+	InsertTurnTelemetryBatch(ctx context.Context, rows []storage.MatchTurnTelemetry) error
+	InsertMatchSummaryTelemetry(ctx context.Context, summary storage.MatchSummaryTelemetry) (storage.MatchSummaryTelemetry, error)
+	CreateQueueTelemetryEvent(ctx context.Context, event storage.QueueTelemetryEvent) (storage.QueueTelemetryEvent, error)
+	CreateSpectatorTelemetryEvent(ctx context.Context, event storage.SpectatorTelemetryEvent) (storage.SpectatorTelemetryEvent, error)
+	CreateTutorialRun(ctx context.Context, run storage.TutorialRun) (storage.TutorialRun, error)
+	MarkTutorialCompleted(ctx context.Context, playerID string, now time.Time) (storage.PlayerProfile, error)
+}
+
 // Telemetry collects counters/timers from matchmaking flows.
 type Telemetry interface {
 	IncCounter(name string)
@@ -63,11 +80,13 @@ type queueLobby interface {
 type InMemoryService struct {
 	lobby        queueLobby
 	finalizer    MatchFinalizer
+	m5Store      m5TelemetryStore
 	resolver     combat.Resolver
 	cfg          MatchConfig
 	telemetry    Telemetry
 	newRenderer  func() animation.Renderer
 	newNPCEngine func() npc.Engine
+	spectators   *spectator.Hub
 
 	nowFn  func() time.Time
 	stopCh chan struct{}
@@ -75,9 +94,12 @@ type InMemoryService struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu      sync.Mutex
-	running bool
-	inMatch map[string]struct{}
+	mu             sync.Mutex
+	running        bool
+	inMatch        map[string]struct{}
+	queueJoinedAt  map[string]time.Time
+	activeMatches  map[string]*activeMatch
+	activeByHandle map[string]string
 }
 
 func NewInMemoryService(lobbySvc queueLobby, finalizer MatchFinalizer, cfg MatchConfig, telemetry Telemetry) *InMemoryService {
@@ -90,18 +112,28 @@ func NewInMemoryService(lobbySvc queueLobby, finalizer MatchFinalizer, cfg Match
 	if cfg.MaxTurns <= 0 {
 		cfg.MaxTurns = 120
 	}
+	var m5Store m5TelemetryStore
+	if typed, ok := finalizer.(m5TelemetryStore); ok {
+		m5Store = typed
+	}
+
 	return &InMemoryService{
-		lobby:        lobbySvc,
-		finalizer:    finalizer,
-		resolver:     combat.NewStandardResolver(),
-		cfg:          cfg,
-		telemetry:    telemetry,
-		newRenderer:  func() animation.Renderer { return animation.NewASCIIRenderer() },
-		newNPCEngine: func() npc.Engine { return npc.NewProbabilisticEngine() },
-		nowFn:        func() time.Time { return time.Now().UTC() },
-		stopCh:       make(chan struct{}),
-		runCtx:       context.Background(),
-		inMatch:      make(map[string]struct{}),
+		lobby:          lobbySvc,
+		finalizer:      finalizer,
+		m5Store:        m5Store,
+		resolver:       combat.NewStandardResolver(),
+		cfg:            cfg,
+		telemetry:      telemetry,
+		newRenderer:    func() animation.Renderer { return animation.NewASCIIRenderer() },
+		newNPCEngine:   func() npc.Engine { return npc.NewProbabilisticEngine() },
+		spectators:     spectator.NewHub(),
+		nowFn:          func() time.Time { return time.Now().UTC() },
+		stopCh:         make(chan struct{}),
+		runCtx:         context.Background(),
+		inMatch:        make(map[string]struct{}),
+		queueJoinedAt:  make(map[string]time.Time),
+		activeMatches:  make(map[string]*activeMatch),
+		activeByHandle: make(map[string]string),
 	}
 }
 
@@ -140,6 +172,9 @@ func (s *InMemoryService) Stop() {
 func (s *InMemoryService) Enqueue(playerID string) error {
 	s.mu.Lock()
 	_, busy := s.inMatch[playerID]
+	if _, exists := s.queueJoinedAt[playerID]; !exists {
+		s.queueJoinedAt[playerID] = s.nowFn()
+	}
 	s.mu.Unlock()
 	if busy {
 		return fmt.Errorf("player %s is already in a match", playerID)
@@ -147,6 +182,11 @@ func (s *InMemoryService) Enqueue(playerID string) error {
 	if err := s.lobby.JoinQueue(playerID); err != nil {
 		return err
 	}
+	s.persistQueueEvent(context.Background(), storage.QueueTelemetryEvent{
+		PlayerID:    playerID,
+		EventType:   "join",
+		QueueWaitMS: 0,
+	})
 	if s.telemetry != nil {
 		s.telemetry.IncCounter("queue_join")
 	}
@@ -157,7 +197,25 @@ func (s *InMemoryService) Enqueue(playerID string) error {
 }
 
 func (s *InMemoryService) Dequeue(playerID string) {
+	s.mu.Lock()
+	joinedAt, exists := s.queueJoinedAt[playerID]
+	if exists {
+		delete(s.queueJoinedAt, playerID)
+	}
+	s.mu.Unlock()
 	_ = s.lobby.LeaveQueue(playerID)
+	waitMS := int64(0)
+	if exists {
+		waitMS = s.nowFn().Sub(joinedAt).Milliseconds()
+		if waitMS < 0 {
+			waitMS = 0
+		}
+	}
+	s.persistQueueEvent(context.Background(), storage.QueueTelemetryEvent{
+		PlayerID:    playerID,
+		EventType:   "leave",
+		QueueWaitMS: waitMS,
+	})
 	if sess, ok := s.lobby.GetSession(playerID); ok {
 		s.sendFrame(sess, "Left queue.")
 	}
@@ -194,6 +252,12 @@ func (s *InMemoryService) loop(ctx context.Context) {
 func (s *InMemoryService) processQueue(now time.Time) {
 	pair, ok, timedOut := s.lobby.PopNextPair(now, s.cfg.QueueTimeout)
 	for _, playerID := range timedOut {
+		waitMS := s.queueWaitAndClear(playerID, now)
+		s.persistQueueEvent(context.Background(), storage.QueueTelemetryEvent{
+			PlayerID:    playerID,
+			EventType:   "timeout",
+			QueueWaitMS: waitMS,
+		})
 		if s.telemetry != nil {
 			s.telemetry.IncCounter("queue_timeout")
 		}
@@ -207,6 +271,18 @@ func (s *InMemoryService) processQueue(now time.Time) {
 	if pair[0] == "" || pair[1] == "" || pair[0] == pair[1] {
 		return
 	}
+	waitP1 := s.queueWaitAndClear(pair[0], now)
+	waitP2 := s.queueWaitAndClear(pair[1], now)
+	s.persistQueueEvent(context.Background(), storage.QueueTelemetryEvent{
+		PlayerID:    pair[0],
+		EventType:   "matched",
+		QueueWaitMS: waitP1,
+	})
+	s.persistQueueEvent(context.Background(), storage.QueueTelemetryEvent{
+		PlayerID:    pair[1],
+		EventType:   "matched",
+		QueueWaitMS: waitP2,
+	})
 
 	s.mu.Lock()
 	if _, busy := s.inMatch[pair[0]]; busy {
@@ -242,12 +318,12 @@ func (s *InMemoryService) processQueue(now time.Time) {
 	s.wg.Add(1)
 	go func(ctx context.Context) {
 		defer s.wg.Done()
-		s.runMatch(ctx, sess1, sess2)
+		s.runMatch(ctx, sess1, sess2, waitP1, waitP2)
 		s.releasePlayers(pair[0], pair[1])
 	}(matchCtx)
 }
 
-func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Session) {
+func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Session, queueWaitMSP1, queueWaitMSP2 int64) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -272,11 +348,48 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 	}
 
 	seed := seedForPair(sess1.PlayerID, sess2.PlayerID, startedAt)
+	matchID := uuid.NewString()
 	initialState := combat.NewMatchState(fighter1, fighter2)
 	replayTurns := make([]storage.MatchReplayTurnWrite, 0, s.cfg.MaxTurns)
 	sim := engine.NewCombatSimulator(initialState, s.resolver, seed)
 	renderer := s.newRenderer()
 	npcEngine := s.newNPCEngine()
+	antiBotCfg := storage.DefaultAntiBotConfig()
+	if s.m5Store != nil {
+		cfg, err := s.m5Store.LoadAntiBotConfig(ctx)
+		if err == nil {
+			antiBotCfg = cfg
+		}
+	}
+	turnTelemetryRows := make([]storage.MatchTurnTelemetry, 0, s.cfg.MaxTurns*2)
+	playerObs := map[string][]telemetrypkg.TurnObservation{
+		sess1.PlayerID: {},
+		sess2.PlayerID: {},
+	}
+	staminaSum := map[string]float64{
+		sess1.PlayerID: 0,
+		sess2.PlayerID: 0,
+	}
+	momentumSum := map[string]float64{
+		sess1.PlayerID: 0,
+		sess2.PlayerID: 0,
+	}
+	comboCount := map[string]int{
+		sess1.PlayerID: 0,
+		sess2.PlayerID: 0,
+	}
+	stunEvents := 0
+	submissionAttempts := 0
+	match := &activeMatch{
+		MatchID:  matchID,
+		P1ID:     sess1.PlayerID,
+		P2ID:     sess2.PlayerID,
+		P1Handle: sess1.Handle,
+		P2Handle: sess2.Handle,
+		Done:     make(chan struct{}),
+	}
+	s.registerActiveMatch(match)
+	defer s.unregisterActiveMatch(match)
 	slot1 := &matchSlot{
 		session: sess1,
 		npcRNG:  engine.NewDeterministicRNG(seedWithSalt(seed, npcSeedSaltP1)),
@@ -330,6 +443,30 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 		payload := buildFramePayload(result.Next.Turn, frame)
 		s.sendFrame(sess1, payload...)
 		s.sendFrame(sess2, payload...)
+		s.spectators.Broadcast(matchID, payload)
+
+		for _, e := range result.Events {
+			if e.Type == combat.EventStatusApplied && e.Detail == "stunned" {
+				stunEvents++
+			}
+		}
+		if state.CombatState != combat.StateSubmissionAttempt && result.Next.CombatState == combat.StateSubmissionAttempt {
+			submissionAttempts++
+		}
+
+		turnRows, perTurnObs := s.buildTurnTelemetryRows(matchID, state, result.Next, canonicalInputs, result.Events, slot1, slot2, antiBotCfg.OptimalityEpsilon)
+		turnTelemetryRows = append(turnTelemetryRows, turnRows...)
+		playerObs[sess1.PlayerID] = append(playerObs[sess1.PlayerID], perTurnObs[sess1.PlayerID]...)
+		playerObs[sess2.PlayerID] = append(playerObs[sess2.PlayerID], perTurnObs[sess2.PlayerID]...)
+		staminaSum[sess1.PlayerID] += float64(result.Next.P1.Stamina)
+		staminaSum[sess2.PlayerID] += float64(result.Next.P2.Stamina)
+		momentumSum[sess1.PlayerID] += float64(result.Next.P1.Momentum)
+		momentumSum[sess2.PlayerID] += float64(result.Next.P2.Momentum)
+		for _, ev := range result.Events {
+			if ev.Type == combat.EventStatusApplied && ev.Detail == "combo_active" {
+				comboCount[ev.PlayerID]++
+			}
+		}
 	}
 
 	finalState := sim.State()
@@ -341,8 +478,8 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 	}
 
 	if s.finalizer != nil {
-		_, err := s.finalizer.FinalizeMatch(ctx, storage.FinalizeMatchParams{
-			MatchID:    uuid.NewString(),
+		finalized, err := s.finalizer.FinalizeMatch(ctx, storage.FinalizeMatchParams{
+			MatchID:    matchID,
 			Player1ID:  sess1.PlayerID,
 			Player2ID:  sess2.PlayerID,
 			WinnerID:   winnerID,
@@ -361,6 +498,8 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 			}
 			s.sendFrame(sess1, "Warning: failed to persist match result.")
 			s.sendFrame(sess2, "Warning: failed to persist match result.")
+		} else {
+			s.persistMatchTelemetry(ctx, finalized, turnTelemetryRows, playerObs, antiBotCfg, comboCount, stunEvents, submissionAttempts, staminaSum, momentumSum, queueWaitMSP1, queueWaitMSP2)
 		}
 	}
 
@@ -388,7 +527,17 @@ const (
 	npcSeedSaltP1            = 0xA5A5A5A5A5A5A5A5
 	npcSeedSaltP2            = 0x5A5A5A5A5A5A5A5A
 	frameKeyframeInterval    = 5
+	tutorialMaxTurns         = 8
 )
+
+type activeMatch struct {
+	MatchID  string
+	P1ID     string
+	P2ID     string
+	P1Handle string
+	P2Handle string
+	Done     chan struct{}
+}
 
 type matchSlot struct {
 	session       player.Session
@@ -751,4 +900,574 @@ func seedWithSalt(seed uint64, salt uint64) uint64 {
 		mixed = 1
 	}
 	return mixed
+}
+
+func (s *InMemoryService) queueWaitAndClear(playerID string, now time.Time) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	joinedAt, exists := s.queueJoinedAt[playerID]
+	if exists {
+		delete(s.queueJoinedAt, playerID)
+	}
+	if !exists {
+		return 0
+	}
+	waitMS := now.Sub(joinedAt).Milliseconds()
+	if waitMS < 0 {
+		waitMS = 0
+	}
+	return waitMS
+}
+
+func (s *InMemoryService) persistQueueEvent(ctx context.Context, event storage.QueueTelemetryEvent) {
+	if s.m5Store == nil {
+		return
+	}
+	_, _ = s.m5Store.CreateQueueTelemetryEvent(ctx, event)
+}
+
+func (s *InMemoryService) registerActiveMatch(match *activeMatch) {
+	if match == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activeMatches[match.MatchID] = match
+	s.activeByHandle[strings.ToLower(match.P1Handle)] = match.MatchID
+	s.activeByHandle[strings.ToLower(match.P2Handle)] = match.MatchID
+	s.spectators.RegisterMatch(match.MatchID)
+}
+
+func (s *InMemoryService) unregisterActiveMatch(match *activeMatch) {
+	if match == nil {
+		return
+	}
+	close(match.Done)
+	s.mu.Lock()
+	delete(s.activeMatches, match.MatchID)
+	delete(s.activeByHandle, strings.ToLower(match.P1Handle))
+	delete(s.activeByHandle, strings.ToLower(match.P2Handle))
+	s.mu.Unlock()
+	s.spectators.UnregisterMatch(match.MatchID)
+}
+
+func (s *InMemoryService) lookupActiveMatchByHandle(handle string) (*activeMatch, bool) {
+	handle = strings.ToLower(strings.TrimSpace(handle))
+	if handle == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	matchID, ok := s.activeByHandle[handle]
+	if !ok {
+		return nil, false
+	}
+	match, exists := s.activeMatches[matchID]
+	return match, exists
+}
+
+func (s *InMemoryService) buildTurnTelemetryRows(
+	matchID string,
+	before combat.MatchState,
+	after combat.MatchState,
+	inputs []combat.TurnInput,
+	events []combat.Event,
+	slot1 *matchSlot,
+	slot2 *matchSlot,
+	optimalityEpsilon float64,
+) ([]storage.MatchTurnTelemetry, map[string][]telemetrypkg.TurnObservation) {
+	rows := make([]storage.MatchTurnTelemetry, 0, len(inputs))
+	obsByPlayer := make(map[string][]telemetrypkg.TurnObservation, 2)
+
+	for _, input := range inputs {
+		beforeF, afterF, opponent, ok := fightersBeforeAfterByID(before, after, input.PlayerID)
+		if !ok {
+			continue
+		}
+		slot := findSlotByPlayerID(input.PlayerID, slot1, slot2)
+		isHuman := slot != nil && !slot.npcControlled
+		success := findActionSuccess(events, input.PlayerID)
+		optimalAction, optimalZone, chosenU, bestU := optimalChoice(before, *beforeF, *opponent, input)
+		isOptimal := chosenU >= (bestU - optimalityEpsilon)
+		if !isHuman {
+			isOptimal = false
+		}
+
+		row := storage.MatchTurnTelemetry{
+			MatchID:           matchID,
+			Turn:              after.Turn,
+			PlayerID:          input.PlayerID,
+			IsHuman:           isHuman,
+			Action:            input.Action.String(),
+			TargetZone:        input.Target.String(),
+			DecisionMS:        maxInt(input.DecisionMS, 0),
+			Success:           success,
+			HPBefore:          beforeF.HP,
+			HPAfter:           afterF.HP,
+			StaminaBefore:     beforeF.Stamina,
+			StaminaAfter:      afterF.Stamina,
+			MomentumBefore:    beforeF.Momentum,
+			MomentumAfter:     afterF.Momentum,
+			IsOptimalChoice:   isOptimal,
+			OptimalAction:     optimalAction.String(),
+			OptimalTargetZone: optimalZone.String(),
+		}
+		rows = append(rows, row)
+		if isHuman {
+			obsByPlayer[input.PlayerID] = append(obsByPlayer[input.PlayerID], telemetrypkg.TurnObservation{
+				DecisionMS: row.DecisionMS,
+				IsOptimal:  row.IsOptimalChoice,
+			})
+		}
+	}
+	return rows, obsByPlayer
+}
+
+func fightersBeforeAfterByID(before, after combat.MatchState, playerID string) (beforeF, afterF, opponent *combat.FighterState, ok bool) {
+	switch playerID {
+	case before.P1.PlayerID:
+		return &before.P1, &after.P1, &before.P2, true
+	case before.P2.PlayerID:
+		return &before.P2, &after.P2, &before.P1, true
+	default:
+		return nil, nil, nil, false
+	}
+}
+
+func findActionSuccess(events []combat.Event, playerID string) bool {
+	for _, e := range events {
+		if e.Type == combat.EventActionResolved && e.PlayerID == playerID {
+			return e.Success
+		}
+	}
+	return false
+}
+
+func optimalChoice(state combat.MatchState, actor, defender combat.FighterState, chosen combat.TurnInput) (combat.Action, combat.Zone, float64, float64) {
+	actions := []combat.Action{
+		combat.ActionStrike,
+		combat.ActionGrapple,
+		combat.ActionBlock,
+		combat.ActionDodge,
+		combat.ActionCounter,
+		combat.ActionFeint,
+		combat.ActionBreak,
+	}
+	zones := []combat.Zone{combat.ZoneHead, combat.ZoneTorso, combat.ZoneLegs}
+	bestU := math.Inf(-1)
+	bestAction := combat.ActionNone
+	bestZone := combat.ZoneTorso
+	chosenU := math.Inf(-1)
+
+	for _, action := range actions {
+		for _, zone := range zones {
+			u := estimateUtility(state, actor, defender, action, zone)
+			if action == chosen.Action && zone == chosen.Target {
+				chosenU = u
+			}
+			if u > bestU {
+				bestU = u
+				bestAction = action
+				bestZone = zone
+			}
+		}
+	}
+	if math.IsInf(chosenU, -1) {
+		chosenU = estimateUtility(state, actor, defender, chosen.Action, chosen.Target)
+	}
+	return bestAction, bestZone, chosenU, bestU
+}
+
+func estimateUtility(state combat.MatchState, actor, defender combat.FighterState, action combat.Action, _ combat.Zone) float64 {
+	attackerAttr := combat.ActionRelevantAttribute(action, actor.Stats)
+	defenderAttr := defensiveAttributeForUtility(action, defender)
+	chance := float64(combat.SuccessChanceBPS(attackerAttr, defenderAttr, actor.Momentum, actor.Stamina)) / 10000.0
+	baseDamage := combat.BaseDamage(action, actor.Stats)
+	expectedDamage := chance * float64(combat.DamageFinal(baseDamage, actor.Momentum, false))
+
+	counterChance := float64(combat.SuccessChanceBPS(
+		combat.ActionRelevantAttribute(combat.ActionStrike, defender.Stats),
+		combat.ActionRelevantAttribute(combat.ActionBlock, actor.Stats),
+		defender.Momentum,
+		defender.Stamina,
+	)) / 10000.0
+	expectedReceived := counterChance * float64(combat.DamageFinal(combat.BaseDamage(combat.ActionStrike, defender.Stats), defender.Momentum, false))
+	if action == combat.ActionBlock || action == combat.ActionDodge {
+		expectedReceived *= 0.7
+	}
+
+	momentumGain := 0.0
+	if combat.IsOffensive(action) {
+		momentumGain = 8.0 * chance
+	}
+	momentumLoss := 6.0 * chance
+	deltaMomentum := momentumGain - momentumLoss
+	staminaCost := float64(combat.ActionStaminaCost(action, actor.Stats.Endurance))
+
+	u := expectedDamage - 0.7*expectedReceived + 0.2*deltaMomentum - 0.1*staminaCost
+	if state.CombatState == combat.StateSubmissionAttempt && action == combat.ActionBreak {
+		u += 2.0
+	}
+	return u
+}
+
+func defensiveAttributeForUtility(action combat.Action, defender combat.FighterState) int {
+	switch action {
+	case combat.ActionStrike:
+		return combat.ClampInt(defender.Stats.Agility, 1, 10)
+	case combat.ActionGrapple, combat.ActionCounter, combat.ActionFeint:
+		return combat.ClampInt(defender.Stats.Technique, 1, 10)
+	case combat.ActionBreak:
+		return combat.ClampInt(defender.Stats.Power, 1, 10)
+	default:
+		return combat.ClampInt(defender.Stats.Technique, 1, 10)
+	}
+}
+
+func (s *InMemoryService) persistMatchTelemetry(
+	ctx context.Context,
+	finalized storage.FinalizedMatch,
+	turnRows []storage.MatchTurnTelemetry,
+	playerObs map[string][]telemetrypkg.TurnObservation,
+	antiBotCfg storage.AntiBotConfig,
+	comboCount map[string]int,
+	stunEvents int,
+	submissionAttempts int,
+	staminaSum map[string]float64,
+	momentumSum map[string]float64,
+	queueWaitMSP1 int64,
+	queueWaitMSP2 int64,
+) {
+	if s.m5Store == nil {
+		return
+	}
+	if len(turnRows) > 0 {
+		_ = s.m5Store.InsertTurnTelemetryBatch(ctx, turnRows)
+	}
+	turnCount := maxInt(len(turnRows)/2, 1)
+	summary := storage.MatchSummaryTelemetry{
+		MatchID:            finalized.Match.ID,
+		SeasonID:           finalized.Season.ID,
+		Player1ID:          finalized.Player1ID,
+		Player2ID:          finalized.Player2ID,
+		WinnerID:           finalized.Match.WinnerID,
+		ResultType:         string(finalized.Match.ResultType),
+		TurnCount:          turnCount,
+		DurationMS:         finalized.Match.DurationMS,
+		AvgDecisionMSP1:    avgDecisionMS(playerObs[finalized.Player1ID]),
+		AvgDecisionMSP2:    avgDecisionMS(playerObs[finalized.Player2ID]),
+		AvgStaminaP1:       staminaSum[finalized.Player1ID] / float64(turnCount),
+		AvgStaminaP2:       staminaSum[finalized.Player2ID] / float64(turnCount),
+		AvgMomentumP1:      momentumSum[finalized.Player1ID] / float64(turnCount),
+		AvgMomentumP2:      momentumSum[finalized.Player2ID] / float64(turnCount),
+		MaxComboP1:         comboCount[finalized.Player1ID],
+		MaxComboP2:         comboCount[finalized.Player2ID],
+		StunEvents:         stunEvents,
+		SubmissionAttempts: submissionAttempts,
+		QueueWaitMSP1:      queueWaitMSP1,
+		QueueWaitMSP2:      queueWaitMSP2,
+	}
+	_, _ = s.m5Store.InsertMatchSummaryTelemetry(ctx, summary)
+
+	for _, playerID := range []string{finalized.Player1ID, finalized.Player2ID} {
+		observations := playerObs[playerID]
+		if len(observations) == 0 {
+			continue
+		}
+		eval := telemetrypkg.EvaluateAntiBot(telemetrypkg.ComputeAntiBotMetrics(observations), antiBotCfg)
+		_, _ = s.m5Store.CreateAntiBotFlag(ctx, storage.AntiBotFlag{
+			PlayerID:            playerID,
+			SeasonID:            finalized.Season.ID,
+			MatchID:             finalized.Match.ID,
+			DecisionCount:       eval.Metrics.DecisionCount,
+			MeanDecisionMS:      eval.Metrics.MeanDecisionMS,
+			DecisionVarianceMS2: eval.Metrics.DecisionVarianceMS2,
+			OptimalPickRate:     eval.Metrics.OptimalPickRate,
+			SuspicionScore:      eval.SuspicionScore,
+			Flagged:             eval.Flagged,
+			Reason:              eval.Reason,
+		})
+	}
+}
+
+func avgDecisionMS(observations []telemetrypkg.TurnObservation) float64 {
+	if len(observations) == 0 {
+		return 0
+	}
+	sum := 0
+	for _, obs := range observations {
+		sum += obs.DecisionMS
+	}
+	return float64(sum) / float64(len(observations))
+}
+
+func maxInt(v, minV int) int {
+	if v < minV {
+		return minV
+	}
+	return v
+}
+
+func (s *InMemoryService) RunTutorial(ctx context.Context, sess player.Session) (storage.TutorialRun, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	startedAt := s.nowFn()
+	npcID := "npc_tutorial_" + sess.PlayerID
+	playerFighter, err := combat.NewFighter(sess.PlayerID, combat.ArchetypeBalanced)
+	if err != nil {
+		return storage.TutorialRun{}, fmt.Errorf("create tutorial fighter: %w", err)
+	}
+	npcFighter, err := combat.NewFighter(npcID, combat.ArchetypeTechnician)
+	if err != nil {
+		return storage.TutorialRun{}, fmt.Errorf("create tutorial npc fighter: %w", err)
+	}
+
+	seed := seedWithSalt(seedForPair(sess.PlayerID, npcID, startedAt), 0xC0FFEE)
+	state := combat.NewMatchState(playerFighter, npcFighter)
+	sim := engine.NewCombatSimulator(state, s.resolver, seed)
+	renderer := s.newRenderer()
+	rng := engine.NewDeterministicRNG(seedWithSalt(seed, 0x1234))
+
+	for turn := 0; turn < tutorialMaxTurns; turn++ {
+		select {
+		case <-ctx.Done():
+			return storage.TutorialRun{}, ctx.Err()
+		default:
+		}
+		curr := sim.State()
+		if curr.Outcome.Finished {
+			break
+		}
+		playerInput := combat.TurnInput{PlayerID: sess.PlayerID, Action: combat.ActionStrike, Target: combat.ZoneTorso, DecisionMS: 250}
+		npcInput := decideTutorialNPCInput(curr, npcID, rng)
+		canonical, err := combat.CanonicalizeInputs(curr, []combat.TurnInput{playerInput, npcInput})
+		if err != nil {
+			return storage.TutorialRun{}, fmt.Errorf("canonicalize tutorial inputs: %w", err)
+		}
+		result, err := sim.Step(canonical)
+		if err != nil {
+			return storage.TutorialRun{}, fmt.Errorf("run tutorial step: %w", err)
+		}
+		frame := renderer.Render(sess.Handle, "Coach NPC", result)
+		payload := buildFramePayload(result.Next.Turn, frame)
+		s.sendFrame(sess, payload...)
+	}
+
+	finalState := sim.State()
+	result := storage.TutorialResultDraw
+	switch {
+	case !finalState.Outcome.Finished:
+		result = storage.TutorialResultDraw
+	case finalState.Outcome.WinnerID == sess.PlayerID:
+		result = storage.TutorialResultWin
+	case finalState.Outcome.WinnerID == npcID:
+		result = storage.TutorialResultLoss
+	default:
+		result = storage.TutorialResultDraw
+	}
+	endedAt := s.nowFn()
+	run := storage.TutorialRun{
+		PlayerID:   sess.PlayerID,
+		Result:     result,
+		StartedAt:  startedAt,
+		EndedAt:    endedAt,
+		DurationMS: int(endedAt.Sub(startedAt).Milliseconds()),
+	}
+	if s.m5Store != nil {
+		created, err := s.m5Store.CreateTutorialRun(ctx, run)
+		if err == nil {
+			run = created
+		}
+		_, _ = s.m5Store.MarkTutorialCompleted(ctx, sess.PlayerID, endedAt)
+	}
+	return run, nil
+}
+
+func decideTutorialNPCInput(state combat.MatchState, npcID string, rng npc.RandomSource) combat.TurnInput {
+	self, opponent, err := tutorialFighters(state, npcID)
+	if err != nil {
+		return combat.TurnInput{PlayerID: npcID, Action: combat.ActionNone, Target: combat.ZoneTorso}
+	}
+	action := combat.ActionDodge
+	target := combat.ZoneTorso
+
+	if self.HP > opponent.HP+10 {
+		action = combat.ActionStrike
+		target = combat.ZoneHead
+	} else if self.Stamina < 35 {
+		action = combat.ActionBlock
+	} else if rng.NextInt(100) < 25 {
+		action = combat.ActionGrapple
+		target = combat.ZoneLegs
+	}
+	return combat.TurnInput{
+		PlayerID:   npcID,
+		Action:     action,
+		Target:     target,
+		DecisionMS: 250,
+	}
+}
+
+func tutorialFighters(state combat.MatchState, npcID string) (*combat.FighterState, *combat.FighterState, error) {
+	if state.P1.PlayerID == npcID {
+		return &state.P1, &state.P2, nil
+	}
+	if state.P2.PlayerID == npcID {
+		return &state.P2, &state.P1, nil
+	}
+	return nil, nil, fmt.Errorf("npc id not present")
+}
+
+func (s *InMemoryService) WatchByHandle(ctx context.Context, spectatorSession player.Session, targetHandle string, waitTimeout time.Duration, maxSpectators int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	targetHandle = strings.TrimSpace(targetHandle)
+	if targetHandle == "" {
+		return fmt.Errorf("target handle is required")
+	}
+	targetPlayerID, err := s.resolveTargetPlayerID(ctx, targetHandle)
+	if err != nil {
+		return fmt.Errorf("target handle %q not found", targetHandle)
+	}
+	if waitTimeout <= 0 {
+		waitTimeout = 120 * time.Second
+	}
+	if maxSpectators <= 0 {
+		maxSpectators = 20
+	}
+	requestedAt := s.nowFn()
+	s.persistSpectatorEvent(ctx, storage.SpectatorTelemetryEvent{
+		SpectatorPlayerID: spectatorSession.PlayerID,
+		TargetPlayerID:    targetPlayerID,
+		EventType:         "watch_requested",
+		WaitMS:            0,
+		Detail:            map[string]any{"target_handle": targetHandle},
+	})
+
+	deadline := requestedAt.Add(waitTimeout)
+	var match *activeMatch
+	for s.nowFn().Before(deadline) {
+		found, ok := s.lookupActiveMatchByHandle(targetHandle)
+		if ok && found != nil {
+			match = found
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if match == nil {
+		waitMS := s.nowFn().Sub(requestedAt).Milliseconds()
+		if waitMS < 0 {
+			waitMS = 0
+		}
+		s.persistSpectatorEvent(ctx, storage.SpectatorTelemetryEvent{
+			SpectatorPlayerID: spectatorSession.PlayerID,
+			TargetPlayerID:    targetPlayerID,
+			EventType:         "watch_timeout",
+			WaitMS:            waitMS,
+			Detail:            map[string]any{"target_handle": targetHandle},
+		})
+		return fmt.Errorf("target has no active pvp match")
+	}
+
+	watcherID := spectatorSession.PlayerID + ":" + uuid.NewString()
+	ch := make(chan []string, 32)
+	if err := s.spectators.AddWatcher(match.MatchID, watcherID, ch, maxSpectators); err != nil {
+		s.persistSpectatorEvent(ctx, storage.SpectatorTelemetryEvent{
+			SpectatorPlayerID: spectatorSession.PlayerID,
+			TargetPlayerID:    targetPlayerID,
+			MatchID:           &match.MatchID,
+			EventType:         "watch_rejected",
+			WaitMS:            0,
+			Detail:            map[string]any{"error": err.Error()},
+		})
+		return err
+	}
+	defer s.spectators.RemoveWatcher(match.MatchID, watcherID)
+
+	waitMS := s.nowFn().Sub(requestedAt).Milliseconds()
+	if waitMS < 0 {
+		waitMS = 0
+	}
+	s.persistSpectatorEvent(ctx, storage.SpectatorTelemetryEvent{
+		SpectatorPlayerID: spectatorSession.PlayerID,
+		TargetPlayerID:    targetPlayerID,
+		MatchID:           &match.MatchID,
+		EventType:         "watch_attached",
+		WaitMS:            waitMS,
+		Detail:            map[string]any{"target_handle": targetHandle},
+	})
+
+	s.sendFrame(spectatorSession, fmt.Sprintf("Watching %s...", targetHandle))
+	for {
+		select {
+		case <-ctx.Done():
+			s.persistSpectatorEvent(ctx, storage.SpectatorTelemetryEvent{
+				SpectatorPlayerID: spectatorSession.PlayerID,
+				TargetPlayerID:    targetPlayerID,
+				MatchID:           &match.MatchID,
+				EventType:         "watch_ended",
+				WaitMS:            0,
+				Detail:            map[string]any{"reason": "context_canceled"},
+			})
+			return ctx.Err()
+		case <-match.Done:
+			s.persistSpectatorEvent(ctx, storage.SpectatorTelemetryEvent{
+				SpectatorPlayerID: spectatorSession.PlayerID,
+				TargetPlayerID:    targetPlayerID,
+				MatchID:           &match.MatchID,
+				EventType:         "watch_ended",
+				WaitMS:            0,
+				Detail:            map[string]any{"reason": "match_finished"},
+			})
+			return nil
+		case payload, ok := <-ch:
+			if !ok {
+				s.persistSpectatorEvent(ctx, storage.SpectatorTelemetryEvent{
+					SpectatorPlayerID: spectatorSession.PlayerID,
+					TargetPlayerID:    targetPlayerID,
+					MatchID:           &match.MatchID,
+					EventType:         "watch_ended",
+					WaitMS:            0,
+					Detail:            map[string]any{"reason": "stream_closed"},
+				})
+				return nil
+			}
+			s.sendFrame(spectatorSession, payload...)
+		}
+	}
+}
+
+func (s *InMemoryService) persistSpectatorEvent(ctx context.Context, event storage.SpectatorTelemetryEvent) {
+	if s == nil || s.m5Store == nil {
+		return
+	}
+	_, _ = s.m5Store.CreateSpectatorTelemetryEvent(ctx, event)
+}
+
+func (s *InMemoryService) resolveTargetPlayerID(ctx context.Context, targetHandle string) (string, error) {
+	match, ok := s.lookupActiveMatchByHandle(targetHandle)
+	if ok && match != nil {
+		switch {
+		case strings.EqualFold(targetHandle, match.P1Handle):
+			return match.P1ID, nil
+		case strings.EqualFold(targetHandle, match.P2Handle):
+			return match.P2ID, nil
+		default:
+			return match.P1ID, nil
+		}
+	}
+	if s == nil || s.m5Store == nil {
+		return "", storage.ErrNotFound
+	}
+	playerEntity, err := s.m5Store.GetByHandle(ctx, targetHandle)
+	if err != nil {
+		return "", err
+	}
+	return playerEntity.ID, nil
 }
