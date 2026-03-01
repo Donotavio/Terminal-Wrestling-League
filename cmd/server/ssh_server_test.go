@@ -432,6 +432,78 @@ func TestRunShellFirstLoginForcesTutorial(t *testing.T) {
 	}
 }
 
+func TestRunShellAcceptsCarriageReturnInput(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  10 * time.Millisecond,
+		MaxTurns:     8,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeTutorialEnsurer{completed: false}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	// Some SSH clients send CR as line terminator in interactive mode.
+	rw := newScriptedReadWriteCloser("help\ra strike head\rq\rquit\r")
+	done := make(chan struct{})
+	go func() {
+		server.runShell(context.Background(), "alice", "127.0.0.1:12345", rw)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("runShell did not return for CR-terminated input")
+	}
+
+	output := strings.ToLower(rw.Output())
+	if !strings.Contains(output, "tutorial phase 2/2") {
+		t.Fatalf("expected tutorial to progress with CR input, got: %s", output)
+	}
+}
+
+func TestRunShellTutorialAcceptsBracketedPasteWrappedInput(t *testing.T) {
+	cfg := Config{
+		SSHAddr:  "127.0.0.1:0",
+		SSHUsers: map[string]string{"alice": "secret"},
+	}
+	lb := lobby.NewInMemoryService()
+	matchSvc := matchmaking.NewInMemoryService(lb, nil, matchmaking.MatchConfig{
+		QueueTimeout: 45 * time.Second,
+		TurnTimeout:  10 * time.Millisecond,
+		MaxTurns:     8,
+	}, nil)
+	server, err := newSSHServer(cfg, lb, matchSvc, &fakeTutorialEnsurer{completed: false}, nil, nil, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new ssh server: %v", err)
+	}
+
+	// Bracketed paste wrappers and ANSI-like sequences should not break tutorial parsing.
+	rw := newScriptedReadWriteCloser("\x1b[200~help\x1b[201~\r\x1b[200~a strike head\x1b[201~\r\x1b[200~q\x1b[201~\rquit\r")
+	done := make(chan struct{})
+	go func() {
+		server.runShell(context.Background(), "alice", "127.0.0.1:12345", rw)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("runShell did not return for bracketed-paste input")
+	}
+
+	output := strings.ToLower(rw.Output())
+	if !strings.Contains(output, "tutorial phase 2/2") {
+		t.Fatalf("expected tutorial to progress with bracketed paste input, got: %s", output)
+	}
+}
+
 func TestTutorialRetryRunsTutorialAgain(t *testing.T) {
 	cfg := Config{
 		SSHAddr:  "127.0.0.1:0",

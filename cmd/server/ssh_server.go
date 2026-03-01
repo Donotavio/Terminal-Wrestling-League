@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,8 @@ import (
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/storage"
 	"golang.org/x/crypto/ssh"
 )
+
+var ansiControlSeqPattern = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 type metricRecorder interface {
 	IncCounter(name string)
@@ -285,6 +288,7 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 	)
 
 	scanner := bufio.NewScanner(rw)
+	scanner.Split(splitCRLF)
 	if !profile.TutorialCompleted {
 		if err := s.runTutorialFlow(ctx, sess, scanner, &profile, false, remoteAddrHash); err != nil {
 			if errors.Is(err, io.EOF) {
@@ -296,7 +300,7 @@ func (s *sshServer) runShell(ctx context.Context, handle, remoteAddr string, rw 
 	}
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		line := sanitizeInputLine(scanner.Text())
 		if line == "" {
 			continue
 		}
@@ -468,7 +472,7 @@ func (s *sshServer) runTutorialFlow(
 				}
 				return io.EOF
 			}
-			line := strings.TrimSpace(strings.ToLower(scanner.Text()))
+			line := canonicalTutorialCommand(scanner.Text())
 			if line == "quit" || line == "exit" {
 				s.sendSessionFrame(sess, "bye")
 				return io.EOF
@@ -648,4 +652,48 @@ func hashRemoteAddr(remoteAddr string) string {
 	}
 	sum := sha256.Sum256([]byte(host))
 	return hex.EncodeToString(sum[:])
+}
+
+func sanitizeInputLine(line string) string {
+	// Strip ANSI/control escape sequences that may arrive from interactive terminals.
+	cleaned := ansiControlSeqPattern.ReplaceAllString(line, "")
+	cleaned = strings.Map(func(r rune) rune {
+		switch {
+		case r == '\t':
+			return ' '
+		case r < 32 || r == 127:
+			return -1
+		default:
+			return r
+		}
+	}, cleaned)
+	return strings.TrimSpace(cleaned)
+}
+
+func canonicalTutorialCommand(line string) string {
+	cleaned := strings.ToLower(sanitizeInputLine(line))
+	if cleaned == "" {
+		return ""
+	}
+	return strings.Join(strings.Fields(cleaned), " ")
+}
+
+func splitCRLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	for i := 0; i < len(data); i++ {
+		if data[i] != '\n' && data[i] != '\r' {
+			continue
+		}
+		advance = i + 1
+		if data[i] == '\r' && i+1 < len(data) && data[i+1] == '\n' {
+			advance++
+		}
+		return advance, data[:i], nil
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
