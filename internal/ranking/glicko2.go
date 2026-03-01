@@ -185,7 +185,7 @@ func solveSigmaPrime(phi, sigma, delta, v, tau, epsilon float64) (float64, error
 		k := 1.0
 		for {
 			B = a - k*tau
-			if f(B) < 0 {
+			if f(B) >= 0 {
 				break
 			}
 			k++
