@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Donotavio/Terminal-Wrestling-League/internal/animation"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/combat"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/lobby"
 	"github.com/Donotavio/Terminal-Wrestling-League/internal/player"
@@ -102,6 +103,58 @@ func TestWaitForTurnInputTimeoutReturnsNone(t *testing.T) {
 	}
 	if input.Target != combat.ZoneTorso {
 		t.Fatalf("target = %s, want Torso", input.Target)
+	}
+}
+
+func TestBuildFramePayloadUsesDeltaBetweenKeyframes(t *testing.T) {
+	frame := animation.Frame{
+		Full:    []string{"Turn 2", "alice HP:100 ST:100 MO:0", "bob HP:100 ST:100 MO:0"},
+		Delta:   []string{"[Δ L1] Turn 2"},
+		Effects: []animation.Effect{animation.EffectShake},
+	}
+
+	payload := buildFramePayload(2, frame)
+	if len(payload) != 2 {
+		t.Fatalf("payload len = %d, want 2", len(payload))
+	}
+	if payload[0] != "[Δ L1] Turn 2" {
+		t.Fatalf("payload[0] = %q, want delta line", payload[0])
+	}
+	if payload[1] != "effects: shake" {
+		t.Fatalf("payload[1] = %q, want effects line", payload[1])
+	}
+}
+
+func TestBuildFramePayloadUsesFullOnKeyframes(t *testing.T) {
+	frame := animation.Frame{
+		Full:  []string{"Turn 5", "alice HP:95 ST:90 MO:4", "bob HP:88 ST:87 MO:2"},
+		Delta: []string{"[Δ L1] Turn 5"},
+	}
+
+	payload := buildFramePayload(5, frame)
+	if len(payload) != len(frame.Full) {
+		t.Fatalf("payload len = %d, want %d", len(payload), len(frame.Full))
+	}
+	if payload[0] != "Turn 5" {
+		t.Fatalf("payload[0] = %q, want full frame keyframe", payload[0])
+	}
+}
+
+func TestOrderTurnResultsBySlotUsesStablePlayerOrder(t *testing.T) {
+	slot1 := &matchSlot{session: makeSession("p1", "alice")}
+	slot2 := &matchSlot{session: makeSession("p2", "bob")}
+
+	ordered, ok := orderTurnResultsBySlot(
+		slot1,
+		slot2,
+		turnInputResult{playerID: "p2", status: turnInputTimeout},
+		turnInputResult{playerID: "p1", status: turnInputDisconnect},
+	)
+	if !ok {
+		t.Fatalf("expected results to be ordered")
+	}
+	if ordered[0].playerID != "p1" || ordered[1].playerID != "p2" {
+		t.Fatalf("ordered players = [%s,%s], want [p1,p2]", ordered[0].playerID, ordered[1].playerID)
 	}
 }
 

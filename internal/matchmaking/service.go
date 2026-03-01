@@ -327,17 +327,7 @@ func (s *InMemoryService) runMatch(ctx context.Context, sess1, sess2 player.Sess
 		})
 
 		frame := renderer.Render(sess1.Handle, sess2.Handle, result)
-		payload := frame.Full
-		if len(frame.Delta) > 0 {
-			payload = frame.Delta
-		}
-		if len(frame.Effects) > 0 {
-			effects := make([]string, 0, len(frame.Effects))
-			for _, effect := range frame.Effects {
-				effects = append(effects, string(effect))
-			}
-			payload = append(payload, fmt.Sprintf("effects: %s", strings.Join(effects, ",")))
-		}
+		payload := buildFramePayload(result.Next.Turn, frame)
 		s.sendFrame(sess1, payload...)
 		s.sendFrame(sess2, payload...)
 	}
@@ -397,6 +387,7 @@ const (
 	npcTakeoverTimeoutStreak = 2
 	npcSeedSaltP1            = 0xA5A5A5A5A5A5A5A5
 	npcSeedSaltP2            = 0x5A5A5A5A5A5A5A5A
+	frameKeyframeInterval    = 5
 )
 
 type matchSlot struct {
@@ -453,7 +444,10 @@ func (s *InMemoryService) collectTurnInputs(
 		return nil, false
 	}
 
-	orderedResults := []turnInputResult{res1, res2}
+	orderedResults, ok := orderTurnResultsBySlot(slot1, slot2, res1, res2)
+	if !ok {
+		return nil, false
+	}
 	turnInputs := make([]combat.TurnInput, 0, 2)
 	for _, res := range orderedResults {
 		slot := findSlotByPlayerID(res.playerID, slot1, slot2)
@@ -472,6 +466,63 @@ func (s *InMemoryService) collectTurnInputs(
 		turnInputs = append(turnInputs, input)
 	}
 	return turnInputs, true
+}
+
+func buildFramePayload(turn int, frame animation.Frame) []string {
+	useDelta := len(frame.Delta) > 0 && !isKeyframeTurn(turn)
+	base := frame.Full
+	if useDelta {
+		base = frame.Delta
+	}
+
+	// Copy payload so appended effect lines do not mutate renderer-owned slices.
+	payload := append([]string(nil), base...)
+	if len(frame.Effects) == 0 {
+		return payload
+	}
+
+	effects := make([]string, 0, len(frame.Effects))
+	for _, effect := range frame.Effects {
+		effects = append(effects, string(effect))
+	}
+	return append(payload, fmt.Sprintf("effects: %s", strings.Join(effects, ",")))
+}
+
+func isKeyframeTurn(turn int) bool {
+	if turn <= 1 {
+		return true
+	}
+	if frameKeyframeInterval <= 0 {
+		return true
+	}
+	return turn%frameKeyframeInterval == 0
+}
+
+func orderTurnResultsBySlot(slot1, slot2 *matchSlot, results ...turnInputResult) ([]turnInputResult, bool) {
+	if slot1 == nil || slot2 == nil {
+		return nil, false
+	}
+
+	resultByPlayer := make(map[string]turnInputResult, len(results))
+	for _, result := range results {
+		if result.playerID == "" {
+			return nil, false
+		}
+		if _, exists := resultByPlayer[result.playerID]; exists {
+			return nil, false
+		}
+		resultByPlayer[result.playerID] = result
+	}
+
+	ordered := make([]turnInputResult, 0, 2)
+	for _, slot := range []*matchSlot{slot1, slot2} {
+		result, ok := resultByPlayer[slot.session.PlayerID]
+		if !ok {
+			return nil, false
+		}
+		ordered = append(ordered, result)
+	}
+	return ordered, true
 }
 
 func waitForTurnInput(ctx context.Context, sess player.Session, timeout time.Duration) turnInputResult {
