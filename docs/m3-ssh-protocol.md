@@ -44,8 +44,18 @@ After login, users can run:
 2. Server runs an authoritative combat loop:
    - each turn waits for player input until `TWL_TURN_TIMEOUT_SEC`
    - missing input becomes `ActionNone`
+   - after 2 consecutive timeouts for one player, NPC takeover is activated for that slot
+   - disconnect/quit during match activates immediate NPC takeover for that slot
+   - once takeover happens, control stays with NPC until match end
 3. Match ends by combat outcome or draw at `TWL_MAX_TURNS`.
 4. Result is persisted through `FinalizeMatch` transaction.
+
+## Frame streaming
+
+- Combat frames are emitted as delta lines derived from an ASCII framebuffer.
+- Delta line format: `"[Δ L<index>] <line>"`.
+- Optional effect line can be emitted: `effects: hitstop,shake,knockback,slowmo`.
+- Replay persistence still stores canonical combat inputs and checksums, independent of frame format.
 
 ## Rate limits
 
